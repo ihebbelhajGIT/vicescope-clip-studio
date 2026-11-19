@@ -1,5 +1,5 @@
 ﻿"""Embedded media preview and selection controls."""
-from PySide6.QtCore import Qt, QUrl, Signal
+from PySide6.QtCore import QSignalBlocker, Qt, QUrl, Signal
 from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer
 from PySide6.QtMultimediaWidgets import QVideoWidget
 from PySide6.QtWidgets import QHBoxLayout, QLabel, QPushButton, QSlider, QVBoxLayout, QWidget
@@ -21,7 +21,7 @@ class VideoPreview(QWidget):
         self.player.setVideoOutput(self.video)
         self.timeline = QSlider(Qt.Orientation.Horizontal)
         self.timeline.setRange(0, 0)
-        self.timeline.sliderMoved.connect(self.player.setPosition)
+        self.timeline.valueChanged.connect(self.player.setPosition)
         self.player.durationChanged.connect(lambda duration: self.timeline.setRange(0, duration))
         self.player.positionChanged.connect(self.update_position)
         layout.addWidget(self.timeline)
@@ -51,5 +51,7 @@ class VideoPreview(QWidget):
             self.player.play()
 
     def update_position(self, position):
-        if not self.timeline.isSliderDown(): self.timeline.setValue(position)
+        if not self.timeline.isSliderDown():
+            with QSignalBlocker(self.timeline):
+                self.timeline.setValue(position)
         self.position_label.setText(f'{position / 1000:.2f} / {self.player.duration() / 1000:.2f} s')
