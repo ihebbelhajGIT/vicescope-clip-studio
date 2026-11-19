@@ -29,6 +29,9 @@ class Store:
                     id TEXT PRIMARY KEY, source_id INTEGER NOT NULL, source_path TEXT NOT NULL,
                     source_sha256 TEXT NOT NULL, start REAL NOT NULL, end REAL NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS exports (
+                    job_id TEXT PRIMARY KEY, output_path TEXT NOT NULL, output_sha256 TEXT NOT NULL
+                );
                 CREATE TABLE IF NOT EXISTS campaigns (
                     id INTEGER PRIMARY KEY, name TEXT NOT NULL, brief TEXT NOT NULL
                 );

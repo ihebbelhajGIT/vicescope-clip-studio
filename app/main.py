@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import logging
 import os
 import sys
@@ -12,6 +13,8 @@ from app.storage import Store
 from app.video import export_bundle, tool_path
 from app.preview import VideoPreview
 from app.highlights import analyze_audio
+from app.autoclip import generate
+from app.review import ReviewQueue
 
 
 class Worker(QObject):
@@ -35,6 +38,7 @@ class Window(QMainWindow):
         root.mkdir(parents=True, exist_ok=True)
         logging.basicConfig(filename=root / "app.log", level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
         self.store = Store(root / "studio.sqlite3")
+        self.review_queue = ReviewQueue(self.store)
         self.setWindowTitle("ViceScope Clip Studio")
         self.resize(1180, 760)
         self.threads = []
@@ -45,6 +49,7 @@ class Window(QMainWindow):
         self.dashboard(); self.discovery(); self.campaigns(); self.editor(); self.transcription()
         for name in ("Livestreams", "Analytics"):
             self.page(name, "Not implemented yet. No data or publishing actions are simulated.")
+        self.review_page()
         self.export_history()
         self.diagnostics()
         self.nav.currentRowChanged.connect(self.pages.setCurrentIndex); self.nav.setCurrentRow(0)
@@ -102,6 +107,7 @@ class Window(QMainWindow):
         self.layout = QComboBox(); self.layout.addItem("Center crop", "center"); self.layout.addItem("Blurred background", "blur"); form.addRow("Layout", self.layout)
         self.hook = QLineEdit(); form.addRow("Opening hook", self.hook)
         self.title = QLineEdit(); self.description = QTextEdit(); form.addRow("Title", self.title); form.addRow("Description", self.description)
+        auto = QPushButton("Generate Shorts automatically"); auto.clicked.connect(self.generate_shorts); v.addWidget(auto)
         b = QPushButton("Render vertical MP4 and metadata"); b.clicked.connect(self.render_clip); v.addWidget(b)
         self.progress = QProgressBar(); self.progress.setRange(0, 1); self.progress.setValue(0); v.addWidget(self.progress); v.addStretch()
     def source_changed(self):
@@ -143,6 +149,86 @@ class Window(QMainWindow):
             self.refresh_history()
             QMessageBox.information(self, "Export complete", f"Saved {result['output_path']}, metadata, and provenance. Nothing was published.")
         self.background(work, completed)
+
+    def generate_shorts(self):
+        directory = QFileDialog.getExistingDirectory(self, "Choose a folder for generated clips")
+        if not directory: return
+        source = self.source.text()
+        self.progress.setRange(0, 0)
+        def completed(items):
+            self.progress.setRange(0, 1); self.progress.setValue(1)
+            self.refresh_review()
+            QMessageBox.information(self, "Ready for review", f"Generated {len(items)} clip(s). Nothing was uploaded.")
+        self.background(lambda: generate(self.store, source, directory), completed)
+
+    def review_page(self):
+        v = self.page("Ready for Review", "Review each clip and its metadata before approving a private upload. Upload is not implemented.")
+        self.review_list = QListWidget(); self.review_list.currentRowChanged.connect(self.select_review); v.addWidget(self.review_list)
+        self.review_preview = VideoPreview(); v.addWidget(self.review_preview)
+        self.review_details = QLabel(); self.review_details.setWordWrap(True); v.addWidget(self.review_details)
+        form = QFormLayout(); v.addLayout(form)
+        self.review_title = QLineEdit(); self.review_description = QTextEdit(); self.review_tags = QLineEdit()
+        form.addRow("Title", self.review_title); form.addRow("Description", self.review_description); form.addRow("Hashtags", self.review_tags)
+        row = QHBoxLayout(); v.addLayout(row)
+        for label, callback in (("Save metadata", self.save_review_metadata), ("Approve private upload", self.approve_review), ("Reject", self.reject_review), ("Open file", self.open_review_file)):
+            button = QPushButton(label); button.clicked.connect(callback); row.addWidget(button)
+        self.refresh_review()
+
+    def refresh_review(self):
+        self.review_rows = self.review_queue.list()
+        self.review_list.clear()
+        for item in self.review_rows:
+            valid = self.review_queue.is_approved(item['id']) if item['status'] == 'approved_private' else False
+            status = 'approved private' if valid else ('approval invalid' if item['status'] == 'approved_private' else item['status'])
+            self.review_list.addItem(f"{status} | {item['start']:.1f}-{item['end']:.1f}s | score {item['score']:.2f}")
+
+    def selected_review(self):
+        index = self.review_list.currentRow()
+        return self.review_rows[index] if 0 <= index < len(self.review_rows) else None
+
+    def select_review(self, index):
+        item = self.selected_review()
+        if item is None: return
+        data = json.loads(item['metadata'])
+        self.review_title.setText(data.get('title', '')); self.review_description.setPlainText(data.get('description', '')); self.review_tags.setText(' '.join(data.get('hashtags', [])))
+        try:
+            rights = self.review_queue.validate(item)
+            state = 'source and output hashes verified'
+            creator = rights['creator']; url = rights['source_url']
+        except Exception as exc:
+            state = f'NOT VERIFIED: {exc}'; creator = ''; url = ''
+        self.review_details.setText(f"Creator: {creator} | Source: {url}\n{item['explanation']}\n{state}")
+        self.review_preview.load(item['output_path'])
+
+    def save_review_metadata(self):
+        item = self.selected_review()
+        if not item: return
+        try:
+            self.review_queue.edit(item['id'], {'title': self.review_title.text(), 'description': self.review_description.toPlainText(), 'hashtags': self.review_tags.text().split()})
+            self.refresh_review()
+        except Exception as exc: QMessageBox.warning(self, "Review", str(exc))
+
+    def review_decision(self, decision):
+        item = self.selected_review()
+        if not item: return
+        try:
+            self.review_queue.decide(item['id'], decision); self.refresh_review()
+        except Exception as exc: QMessageBox.warning(self, "Review", str(exc))
+
+    def approve_review(self):
+        item = self.selected_review()
+        if not item: return
+        displayed = {'title': self.review_title.text(), 'description': self.review_description.toPlainText(), 'hashtags': self.review_tags.text().split()}
+        if displayed != json.loads(item['metadata']):
+            QMessageBox.warning(self, "Review", "Save the edited metadata before approval.")
+            return
+        self.review_decision('approved_private')
+    def reject_review(self): self.review_decision('rejected')
+    def open_review_file(self):
+        from PySide6.QtCore import QUrl
+        from PySide6.QtGui import QDesktopServices
+        item = self.selected_review()
+        if item: QDesktopServices.openUrl(QUrl.fromLocalFile(item['output_path']))
 
     def export_history(self):
         v = self.page("Export Queue", "Only packages with video, metadata and provenance are listed as completed.")
@@ -246,6 +332,7 @@ class Window(QMainWindow):
         else:
             from PySide6.QtCore import QUrl
             self.preview.player.stop(); self.preview.player.setSource(QUrl())
+            self.review_preview.player.stop(); self.review_preview.player.setSource(QUrl())
             event.accept()
 
 
