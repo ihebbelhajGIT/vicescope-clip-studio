@@ -30,6 +30,7 @@ exports/
 render_tmp/
 build/
 dist/
+.vicescope-runtime/
 client_secret*.json
 youtube-client.json
 token.json
