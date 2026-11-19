@@ -30,3 +30,7 @@ exports/
 render_tmp/
 build/
 dist/
+client_secret*.json
+youtube-client.json
+token.json
+youtube-token*.json

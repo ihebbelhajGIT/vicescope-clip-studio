@@ -16,6 +16,9 @@ from app.preview import VideoPreview
 from app.highlights import analyze_audio
 from app.autoclip import generate, regenerate
 from app.review import ReviewQueue
+from app.youtube import YouTubeAccount
+from app.youtube_jobs import YouTubeJobs
+from app.youtube_ui import YouTubePanel
 from app.acquisition import youtube_id, authorize, acquire
 
 
@@ -42,6 +45,8 @@ class Window(QMainWindow):
         logging.basicConfig(filename=root / "app.log", level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
         self.store = Store(root / "studio.sqlite3")
         self.review_queue = ReviewQueue(self.store)
+        account = YouTubeAccount(root / 'youtube-client.json', os.environ.get('VICESCOPE_YOUTUBE_CHANNEL_ID', '').strip())
+        self.youtube_jobs = YouTubeJobs(self.review_queue, account)
         self.setWindowTitle("ViceScope Clip Studio")
         self.resize(1180, 760)
         self.threads = []
@@ -207,7 +212,7 @@ class Window(QMainWindow):
         self.progress_label.setText(message)
 
     def review_page(self):
-        v = self.page("Ready for Review", "Review each clip and its metadata before approving a private upload. Upload is not implemented.")
+        v = self.page("Ready for Review", "Review each clip and approve its private upload. You can publish it separately after upload.")
         self.review_list = QListWidget(); self.review_list.currentRowChanged.connect(self.select_review); v.addWidget(self.review_list)
         self.review_preview = VideoPreview(); v.addWidget(self.review_preview)
         self.review_details = QLabel(); self.review_details.setWordWrap(True); v.addWidget(self.review_details)
@@ -217,6 +222,8 @@ class Window(QMainWindow):
         row = QHBoxLayout(); v.addLayout(row)
         for label, callback in (("Save metadata", self.save_review_metadata), ("Approve private upload", self.approve_review), ("Reject", self.reject_review), ("Regenerate", self.regenerate_review), ("Open file", self.open_review_file)):
             button = QPushButton(label); button.clicked.connect(callback); row.addWidget(button)
+        self.youtube_panel = YouTubePanel(self, self.youtube_jobs)
+        v.addWidget(self.youtube_panel)
         self.refresh_review()
 
     def refresh_review(self):
@@ -226,12 +233,14 @@ class Window(QMainWindow):
             valid = self.review_queue.is_approved(item['id']) if item['status'] == 'approved_private' else False
             status = 'approved private' if valid else ('approval invalid' if item['status'] == 'approved_private' else item['status'])
             self.review_list.addItem(f"{status} | {item['start']:.1f}-{item['end']:.1f}s | score {item['score']:.2f}")
+        self.youtube_panel.refresh()
 
     def selected_review(self):
         index = self.review_list.currentRow()
         return self.review_rows[index] if 0 <= index < len(self.review_rows) else None
 
     def select_review(self, index):
+        self.youtube_panel.refresh()
         item = self.selected_review()
         if item is None: return
         data = json.loads(item['metadata'])
@@ -260,14 +269,18 @@ class Window(QMainWindow):
             self.review_queue.decide(item['id'], decision); self.refresh_review()
         except Exception as exc: QMessageBox.warning(self, "Review", str(exc))
 
-    def approve_review(self):
-        item = self.selected_review()
-        if not item: return
+    def review_fields_saved(self, item):
         displayed = {'title': self.review_title.text(), 'description': self.review_description.toPlainText(), 'hashtags': self.review_tags.text().split()}
         if displayed != json.loads(item['metadata']):
-            QMessageBox.warning(self, "Review", "Save the edited metadata before approval.")
-            return
-        self.review_decision('approved_private')
+            QMessageBox.warning(self, "Review", "Save and approve the edited metadata before continuing.")
+            return False
+        return True
+
+    def approve_review(self):
+        item = self.selected_review()
+        if item and self.review_fields_saved(item):
+            self.review_decision('approved_private')
+
     def reject_review(self): self.review_decision('rejected')
     def regenerate_review(self):
         item = self.selected_review()
@@ -371,12 +384,12 @@ class Window(QMainWindow):
                     self.transcript.selectRow(row); break
             except (AttributeError, ValueError): pass
 
-    def background(self, fn, done, generation_cancel=None):
+    def background(self, fn, done, generation_cancel=None, failed=None):
         thread = QThread(self)
         worker = Worker((lambda: fn(worker.progress.emit, generation_cancel.is_set)) if generation_cancel else fn)
         worker.moveToThread(thread)
         worker.progress.connect(self.update_generation_progress)
-        thread.started.connect(worker.run); worker.finished.connect(done); worker.failed.connect(self.show_error)
+        thread.started.connect(worker.run); worker.finished.connect(done); worker.failed.connect(failed or self.show_error)
         worker.finished.connect(thread.quit); worker.failed.connect(thread.quit); worker.finished.connect(worker.deleteLater); worker.failed.connect(worker.deleteLater)
         thread.finished.connect(lambda: self.threads.remove((thread, worker))); thread.finished.connect(thread.deleteLater)
         if generation_cancel:

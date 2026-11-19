@@ -146,11 +146,38 @@ class ReviewQueue:
             if not changed.rowcount:
                 raise ValueError('Original review changed during regeneration; review both versions')
 
-    def is_approved(self, item_id):
+    def approval_matches(self, item_id, hashes):
+        with self.store.connect() as db:
+            row = db.execute("""SELECT r.approved_output_hash, r.approved_metadata_hash
+                FROM review_items r JOIN clip_jobs j ON j.id=r.job_id
+                JOIN sources s ON s.id=j.source_id
+                WHERE r.id=? AND r.status='approved_private' AND s.approved=1
+                AND s.sha256=j.source_sha256""", (item_id,)).fetchone()
+            if row == hashes:
+                rights = db.execute("""SELECT s.youtube_video_id, s.creator, s.permission_evidence
+                    FROM review_items r JOIN clip_jobs j ON j.id=r.job_id
+                    JOIN sources s ON s.id=j.source_id WHERE r.id=?""", (item_id,)).fetchone()
+                video_id, creator, evidence = rights
+                if video_id:
+                    permission = db.execute("""SELECT creator, evidence FROM youtube_permissions
+                        WHERE video_id=? AND approved=1""", (video_id,)).fetchone()
+                    return permission == (creator, evidence)
+                return bool(evidence.strip())
+        return False
+
+    def require_private_approval(self, item_id):
         item = self.get(item_id)
-        if not item or item['status'] != 'approved_private': return False
+        if not item or item['status'] != 'approved_private':
+            raise PermissionError('Approve this review item for private upload first.')
+        self.validate(item)
+        if (item['approved_output_hash'] != item['output_sha256']
+                or item['approved_metadata_hash'] != metadata_hash(json.loads(item['metadata']))):
+            raise PermissionError('Review approval no longer matches the video and metadata.')
+        return item
+
+    def is_approved(self, item_id):
         try:
-            self.validate(item)
-            return item['approved_output_hash'] == item['output_sha256'] and item['approved_metadata_hash'] == metadata_hash(json.loads(item['metadata']))
-        except (OSError, PermissionError, ValueError):
+            self.require_private_approval(item_id)
+            return True
+        except (OSError, ValueError):
             return False

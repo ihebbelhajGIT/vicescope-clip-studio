@@ -5,3 +5,6 @@ faster-whisper>=1.1,<2
 pytest>=8,<10
 
 av>=11,<16
+google-auth-oauthlib>=1.2,<2
+keyring>=25,<26; sys_platform == "win32"
+filelock>=3.16,<4
