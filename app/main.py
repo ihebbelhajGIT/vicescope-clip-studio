@@ -9,7 +9,7 @@ from pathlib import Path
 from logging.handlers import RotatingFileHandler
 
 from PySide6.QtCore import QObject, QThread, Signal
-from PySide6.QtWidgets import (QApplication, QCheckBox, QComboBox, QDoubleSpinBox, QFileDialog, QFormLayout, QHBoxLayout, QInputDialog, QLabel, QLineEdit, QListWidget, QMainWindow, QMessageBox, QProgressBar, QPushButton, QSpinBox, QStackedWidget, QTableWidget, QTableWidgetItem, QTextEdit, QVBoxLayout, QWidget)
+from PySide6.QtWidgets import (QApplication, QCheckBox, QComboBox, QDoubleSpinBox, QFileDialog, QFormLayout, QHBoxLayout, QInputDialog, QLabel, QLineEdit, QListWidget, QMainWindow, QMessageBox, QProgressBar, QPushButton, QScrollArea, QSpinBox, QStackedWidget, QTableWidget, QTableWidgetItem, QTextEdit, QVBoxLayout, QWidget)
 from app.core import discover, transcribe, require_rights
 from app.platform_support import application_paths, settings
 from app.storage import Store
@@ -71,7 +71,9 @@ class Window(QMainWindow):
     def page(self, name, description):
         self.nav.addItem(name); w = QWidget(); v = QVBoxLayout(w); v.setContentsMargins(32, 30, 32, 30)
         title = QLabel(name); title.setObjectName("heading"); v.addWidget(title)
-        note = QLabel(description); note.setWordWrap(True); v.addWidget(note); self.pages.addWidget(w)
+        note = QLabel(description); note.setWordWrap(True); v.addWidget(note)
+        scroll = QScrollArea(); scroll.setWidgetResizable(True); scroll.setWidget(w)
+        self.pages.addWidget(scroll)
         return v
 
     def dashboard(self):
