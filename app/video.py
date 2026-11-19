@@ -55,7 +55,7 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
     return header + "\n".join(lines) + "\n"
 
 
-def render(store, source: str, start: float, end: float, destination: str, words: list[dict], hook: str, title: str, layout: str = "center"):
+def render(store, source: str, start: float, end: float, destination: str, words: list[dict], hook: str, title: str, layout: str = "center", cpu_threads: int = 0):
     job = create_job(store, source, start, end)
     rights = verify_job(store, job)
     target = Path(destination).resolve()
@@ -78,7 +78,10 @@ def render(store, source: str, start: float, end: float, destination: str, words
             vf = "split=2[bg][fg];[bg]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,boxblur=20:5[back];[fg]scale=1080:1920:force_original_aspect_ratio=decrease[front];[back][front]overlay=(W-w)/2:(H-h)/2,setsar=1,subtitles=captions.ass"
         else:
             raise ValueError("Unknown layout")
-        cmd = [tool_path("ffmpeg"), "-hide_banner", "-loglevel", "error", "-nostdin", "-ss", str(start), "-i", str(Path(source).resolve()), "-t", str(end-start), "-vf", vf, "-r", "30", "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p", "-c:a", "aac", "-movflags", "+faststart", str(intermediate)]
+        if not isinstance(cpu_threads, int) or cpu_threads < 0: raise ValueError('Invalid CPU thread count')
+        limits = ['-threads', str(cpu_threads), '-filter_threads', str(cpu_threads)] if cpu_threads else []
+        encode_threads = ['-threads', str(cpu_threads)] if cpu_threads else []
+        cmd = [tool_path("ffmpeg"), "-hide_banner", "-loglevel", "error", "-nostdin", *limits, "-ss", str(start), "-i", str(Path(source).resolve()), "-t", str(end-start), "-vf", vf, "-r", "30", "-c:v", "libx264", *encode_threads, "-preset", "ultrafast", "-pix_fmt", "yuv420p", "-c:a", "aac", "-movflags", "+faststart", str(intermediate)]
         subprocess.run(cmd, cwd=directory, capture_output=True, check=True, timeout=3600, **process_options())
         verify_job(store, job)
         output = probe(intermediate)
@@ -118,12 +121,13 @@ def prepare_package(store, result: dict, destination: str, description: str = ""
     return path
 
 
-def export_bundle(store, source: str, start: float, end: float, destination: str, words: list[dict], hook: str, title: str, description: str, layout: str = "center", mark_complete: bool = True):
+def export_bundle(store, source: str, start: float, end: float, destination: str, words: list[dict], hook: str, title: str, description: str, layout: str = "center", mark_complete: bool = True, cpu_threads: int = 0):
     """Create a new directory; failures leave a clearly incomplete directory for review."""
     target = Path(destination).resolve()
     target.mkdir(parents=False, exist_ok=False)
     try:
-        result = render(store, source, start, end, str(target / "clip.mp4"), words, hook, title, layout)
+        kwargs = {'cpu_threads': cpu_threads} if cpu_threads else {}
+        result = render(store, source, start, end, str(target / "clip.mp4"), words, hook, title, layout, **kwargs)
         prepare_package(store, result, str(target / "metadata.json"), description)
         record = {"job_id": result["job_id"], "source_sha256": result["source_sha256"], "output_sha256": result["output_sha256"], "start": start, "end": end, "source_url": result["source_url"], "creator": result["creator"], "layout": layout}
         with (target / "provenance.json").open("x", encoding="utf-8") as out:

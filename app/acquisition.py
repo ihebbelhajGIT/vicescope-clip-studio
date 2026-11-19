@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import re
+import json
 import subprocess
 import uuid
 from pathlib import Path
@@ -50,6 +51,29 @@ def authorize(store, url: str, creator: str, evidence: str):
             db.execute('UPDATE sources SET approved=0 WHERE source_url=?', (source_url,))
         db.execute('INSERT INTO youtube_permissions VALUES(?,?,?,1) ON CONFLICT(video_id) DO UPDATE SET creator=excluded.creator,evidence=excluded.evidence,approved=1', (video_id, creator.strip(), evidence.strip()))
     return video_id
+
+
+def inspect_completed_video(url: str, runner=subprocess.run):
+    """Read public metadata only for an already authorized exact video."""
+    video_id = youtube_id(url)
+    canonical_url = 'https://www.youtube.com/watch?v=' + video_id
+    cmd = ytdlp_command('--ignore-config', '--no-cookies', '--no-playlist', '--skip-download', '--dump-single-json', canonical_url)
+    try:
+        result = runner(cmd, capture_output=True, check=True, timeout=90, **process_options(bundled_child=True))
+        info = json.loads(result.stdout)
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError('YouTube metadata request timed out') from exc
+    except subprocess.CalledProcessError as exc:
+        raise RuntimeError('YouTube metadata is unavailable; check access and connection') from exc
+    except (ValueError, TypeError) as exc:
+        raise RuntimeError('YouTube returned invalid video metadata') from exc
+    if not isinstance(info, dict) or info.get('id') != video_id:
+        raise ValueError('YouTube metadata does not match the authorized video')
+    if info.get('has_drm') or info.get('availability') in ('private', 'needs_auth', 'premium_only', 'subscriber_only'):
+        raise PermissionError('Video is restricted or requires authentication')
+    if info.get('is_live') or info.get('live_status') not in ('not_live', 'was_live'):
+        raise ValueError('Video is live, upcoming, or its completed status is unknown')
+    return {'video_id': video_id, 'live_status': info['live_status']}
 
 
 def acquire(store, url: str, root: str, runner=subprocess.run):

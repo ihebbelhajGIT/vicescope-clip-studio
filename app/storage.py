@@ -46,6 +46,8 @@ class Store:
                     db.execute("""UPDATE sources SET youtube_video_id=substr(source_url,33)
                         WHERE source_url='https://www.youtube.com/watch?v=' || substr(source_url,33)
                         AND EXISTS (SELECT 1 FROM youtube_permissions WHERE video_id=substr(source_url,33))""")
+            if "automation_source_id" not in columns:
+                db.execute("ALTER TABLE sources ADD COLUMN automation_source_id TEXT")
 
     @contextmanager
     def connect(self):
@@ -56,7 +58,7 @@ class Store:
         finally:
             db.close()
 
-    def save_source(self, path: str, creator: str, source_url: str, evidence: str, approved: bool, youtube_video_id: str | None = None):
+    def save_source(self, path: str, creator: str, source_url: str, evidence: str, approved: bool, youtube_video_id: str | None = None, automation_source_id: str | None = None, only_if_new: bool = False):
         resolved = Path(path).expanduser().resolve(strict=True)
         if not resolved.is_file():
             raise ValueError("Select a local video file")
@@ -64,14 +66,22 @@ class Store:
             raise ValueError("Permission evidence is required for approval")
         digest = file_hash(resolved)
         with self.connect() as db:
-            old = db.execute("SELECT id,creator,source_url,permission_evidence,approved,sha256 FROM sources WHERE path=?", (str(resolved),)).fetchone()
-            current = (creator.strip(), source_url.strip(), evidence.strip(), int(approved), digest)
+            db.execute('BEGIN IMMEDIATE')
+            if automation_source_id:
+                grant = db.execute('SELECT kind,value,creator,evidence,enabled,auto_approve FROM automation_sources WHERE id=?', (automation_source_id,)).fetchone()
+                if (not grant or grant[0] != 'folder' or not grant[4] or not grant[5]
+                        or resolved.parent != Path(grant[1]) or grant[2:4] != (creator.strip(), evidence.strip())
+                        or source_url or not approved or youtube_video_id):
+                    raise PermissionError('The folder authorization is missing, disabled, or does not cover this file')
+            old = db.execute("SELECT id,creator,source_url,permission_evidence,approved,sha256,automation_source_id FROM sources WHERE path=?", (str(resolved),)).fetchone()
+            if only_if_new and old: raise ValueError('Source already has an explicit rights record')
+            current = (creator.strip(), source_url.strip(), evidence.strip(), int(approved), digest, automation_source_id)
             if old and old[1:] != current:
                 exists = db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='review_items'").fetchone()
                 if exists:
                     db.execute("""UPDATE review_items SET status='ready', approved_output_hash=NULL, approved_metadata_hash=NULL
                         WHERE status='approved_private' AND job_id IN (SELECT id FROM clip_jobs WHERE source_id=?)""", (old[0],))
-            db.execute("INSERT INTO sources(path,creator,source_url,permission_evidence,approved,sha256,youtube_video_id) VALUES(?,?,?,?,?,?,?) ON CONFLICT(path) DO UPDATE SET creator=excluded.creator,source_url=excluded.source_url,permission_evidence=excluded.permission_evidence,approved=excluded.approved,sha256=excluded.sha256,youtube_video_id=COALESCE(excluded.youtube_video_id,sources.youtube_video_id)", (str(resolved), creator.strip(), source_url.strip(), evidence.strip(), int(approved), digest, youtube_video_id))
+            db.execute("INSERT INTO sources(path,creator,source_url,permission_evidence,approved,sha256,youtube_video_id,automation_source_id) VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(path) DO UPDATE SET creator=excluded.creator,source_url=excluded.source_url,permission_evidence=excluded.permission_evidence,approved=excluded.approved,sha256=excluded.sha256,youtube_video_id=COALESCE(excluded.youtube_video_id,sources.youtube_video_id),automation_source_id=excluded.automation_source_id", (str(resolved), creator.strip(), source_url.strip(), evidence.strip(), int(approved), digest, youtube_video_id, automation_source_id))
 
     def source(self, path: str):
         with self.connect() as db:

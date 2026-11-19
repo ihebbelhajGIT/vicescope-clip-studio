@@ -1,0 +1,260 @@
+﻿"""Persistent, single-worker automation for explicitly authorized sources.
+
+A folder grant does not authorize its contents: every local file must have an
+existing approved, hash-matching source record. Interrupted processing is not
+retried automatically because it may have produced partial outputs.
+"""
+from __future__ import annotations
+
+import sqlite3
+import uuid
+import json
+import time
+import shutil
+from pathlib import Path
+from filelock import FileLock, Timeout
+from app.acquisition import acquire, authorize, youtube_id, inspect_completed_video
+from app.core import require_rights
+from app.autoclip import generate
+
+VIDEO_EXTENSIONS = {'.mp4', '.mov', '.mkv', '.webm', '.m4v'}
+
+
+class Automation:
+    def __init__(self, store, clock=time.time, settle_seconds=10):
+        self.store = store
+        self.clock = clock
+        self.settle_seconds = settle_seconds
+        self.lock = FileLock(str(store.path) + '.automation.lock', timeout=0)
+        with store.connect() as db:
+            db.executescript('''
+                CREATE TABLE IF NOT EXISTS automation_sources (
+                    id TEXT PRIMARY KEY, kind TEXT NOT NULL, value TEXT NOT NULL,
+                    creator TEXT NOT NULL, evidence TEXT NOT NULL, enabled INTEGER NOT NULL DEFAULT 1,
+                    UNIQUE(kind,value));
+                CREATE TABLE IF NOT EXISTS automation_jobs (
+                    id TEXT PRIMARY KEY, source_id TEXT NOT NULL, source_key TEXT NOT NULL UNIQUE,
+                    path TEXT, size INTEGER, mtime_ns INTEGER, digest TEXT, status TEXT NOT NULL,
+                    error TEXT NOT NULL DEFAULT '', discovered_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
+                CREATE TABLE IF NOT EXISTS automation_settings (id INTEGER PRIMARY KEY CHECK(id=1), value TEXT NOT NULL);
+            ''')
+            columns = {row[1] for row in db.execute('PRAGMA table_info(automation_jobs)')}
+            if 'observed_at' not in columns:
+                db.execute('ALTER TABLE automation_jobs ADD COLUMN observed_at REAL NOT NULL DEFAULT 0')
+            if 'attempts' not in columns:
+                db.execute('ALTER TABLE automation_jobs ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0')
+            if 'next_retry' not in columns:
+                db.execute('ALTER TABLE automation_jobs ADD COLUMN next_retry REAL')
+            source_columns = {row[1] for row in db.execute('PRAGMA table_info(automation_sources)')}
+            if 'auto_approve' not in source_columns:
+                db.execute('ALTER TABLE automation_sources ADD COLUMN auto_approve INTEGER NOT NULL DEFAULT 0')
+        try:
+            with self.lock:
+                with store.connect() as db:
+                    db.execute("UPDATE automation_jobs SET status='interrupted', error='Processing stopped unexpectedly; inspect partial outputs before retrying', updated_at=CURRENT_TIMESTAMP WHERE status='processing'")
+        except Timeout:
+            # Another instance may still be processing. Never change its state.
+            pass
+
+    def add_source(self, kind, value, creator, evidence, auto_approve=False):
+        if kind not in ('folder', 'youtube_video') or not creator.strip() or not evidence.strip():
+            raise ValueError('Select a supported source and provide creator and rights evidence')
+        if auto_approve and kind != 'folder': raise ValueError('Folder-wide authorization applies only to local folders')
+        if kind == 'folder':
+            path = Path(value).expanduser().resolve(strict=True)
+            if not path.is_dir(): raise ValueError('Choose an existing local folder')
+            value = str(path)
+        else:
+            video_id = youtube_id(value)
+            value = 'https://www.youtube.com/watch?v=' + video_id
+            with self.store.connect() as db:
+                if db.execute('SELECT 1 FROM automation_sources WHERE kind=? AND value=?', (kind, value)).fetchone():
+                    raise ValueError('This source is already configured')
+            authorize(self.store, value, creator, evidence)
+        source_id = str(uuid.uuid4())
+        with self.store.connect() as db:
+            db.execute('INSERT INTO automation_sources(id,kind,value,creator,evidence,auto_approve) VALUES(?,?,?,?,?,?)', (source_id, kind, value, creator.strip(), evidence.strip(), int(bool(auto_approve))))
+        return source_id
+
+    def set_enabled(self, source_id, enabled):
+        with self.store.connect() as db:
+            result = db.execute('UPDATE automation_sources SET enabled=? WHERE id=?', (int(bool(enabled)), source_id))
+            if not result.rowcount: raise ValueError('Source not found')
+            if not enabled and db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='review_items'").fetchone():
+                db.execute("""UPDATE review_items SET status='ready', approved_output_hash=NULL, approved_metadata_hash=NULL
+                    WHERE status='approved_private' AND job_id IN (SELECT j.id FROM clip_jobs j JOIN sources s ON j.source_id=s.id WHERE s.automation_source_id=?)""", (source_id,))
+
+    def save_settings(self, settings):
+        with self.store.connect() as db:
+            db.execute('INSERT INTO automation_settings(id,value) VALUES(1,?) ON CONFLICT(id) DO UPDATE SET value=excluded.value', (json.dumps(settings),))
+
+    def settings(self):
+        with self.store.connect() as db:
+            row = db.execute('SELECT value FROM automation_settings WHERE id=1').fetchone()
+        if not row: return {}
+        try:
+            data = json.loads(row[0])
+            return data if isinstance(data, dict) else {}
+        except (TypeError, ValueError):
+            return {}
+
+    def list_sources(self):
+        with self.store.connect() as db:
+            db.row_factory = sqlite3.Row
+            return [dict(x) for x in db.execute('SELECT * FROM automation_sources ORDER BY rowid DESC')]
+
+    def list_jobs(self):
+        with self.store.connect() as db:
+            db.row_factory = sqlite3.Row
+            return [dict(x) for x in db.execute('SELECT * FROM automation_jobs ORDER BY updated_at DESC, rowid DESC')]
+
+    def scan(self):
+        for source in self.list_sources():
+            if not source['enabled']: continue
+            if source['kind'] == 'youtube_video':
+                self._observe_youtube(source)
+            elif source['kind'] == 'folder':
+                self._observe_folder(source)
+
+    def _observe_youtube(self, source):
+        video_id = youtube_id(source['value'])
+        with self.store.connect() as db:
+            rights = db.execute('SELECT creator,evidence,approved FROM youtube_permissions WHERE video_id=?', (video_id,)).fetchone()
+            authorized = rights == (source['creator'], source['evidence'], 1)
+            db.execute('''INSERT INTO automation_jobs(id,source_id,source_key,status,error) VALUES(?,?,?,?,?)
+                ON CONFLICT(source_key) DO UPDATE SET
+                    status=CASE WHEN automation_jobs.status IN ('pending','awaiting_authorization') OR (automation_jobs.status='retry_wait' AND (excluded.status='awaiting_authorization' OR automation_jobs.next_retry<=?)) THEN excluded.status ELSE automation_jobs.status END,
+                    error=CASE WHEN automation_jobs.status IN ('pending','awaiting_authorization') OR (automation_jobs.status='retry_wait' AND (excluded.status='awaiting_authorization' OR automation_jobs.next_retry<=?)) THEN excluded.error ELSE automation_jobs.error END,
+                    updated_at=CURRENT_TIMESTAMP''', (str(uuid.uuid4()), source['id'], 'youtube:' + video_id, 'pending' if authorized else 'awaiting_authorization', '' if authorized else 'Exact video permission is missing or changed',self.clock(),self.clock()))
+
+    def _observe_folder(self, source):
+        folder = Path(source['value'])
+        if not folder.is_dir():
+            self._source_error(source, 'Folder is unavailable')
+            return
+        try:
+            files = list(folder.iterdir())
+        except OSError as exc:
+            self._source_error(source, f'Cannot scan folder: {exc}')
+            return
+        for path in files:
+            try:
+                if path.is_symlink() or not path.is_file() or path.suffix.lower() not in VIDEO_EXTENSIONS: continue
+                resolved = path.resolve(strict=True)
+                if resolved.parent != folder: continue
+                stat = resolved.stat()
+            except OSError:
+                continue
+            # Preserve history when a file at the same path is replaced or grows.
+            key = f'file:{str(resolved).casefold()}:{stat.st_size}:{stat.st_mtime_ns}'
+            with self.store.connect() as db:
+                db.execute("""UPDATE automation_jobs SET status='superseded',
+                    error='Source changed since discovery',updated_at=CURRENT_TIMESTAMP
+                    WHERE path=? AND source_key!=? AND status IN ('observing','awaiting_authorization','pending')""", (str(resolved), key))
+                row = db.execute('SELECT id,size,mtime_ns,status,observed_at FROM automation_jobs WHERE source_key=?', (key,)).fetchone()
+                if row is None:
+                    db.execute('INSERT INTO automation_jobs(id,source_id,source_key,path,size,mtime_ns,status,observed_at) VALUES(?,?,?,?,?,?,?,?)', (str(uuid.uuid4()),source['id'],key,str(resolved),stat.st_size,stat.st_mtime_ns,'observing',self.clock()))
+                    continue
+                job_id, old_size, old_mtime, status, observed_at = row
+                if status in ('processing','completed','failed','interrupted','duplicate'): continue
+                if old_size != stat.st_size or old_mtime != stat.st_mtime_ns:
+                    db.execute("UPDATE automation_jobs SET size=?,mtime_ns=?,status='observing',digest=NULL,error='',observed_at=?,updated_at=CURRENT_TIMESTAMP WHERE id=?", (stat.st_size,stat.st_mtime_ns,self.clock(),job_id))
+                    continue
+                if self.clock() - observed_at < self.settle_seconds:
+                    continue
+            try:
+                try:
+                    rights = require_rights(self.store, str(resolved))
+                except PermissionError:
+                    # Only an explicit folder-wide grant can authorize new files.
+                    # Never overwrite a pre-existing per-file rights decision.
+                    if not source['auto_approve'] or self.store.source(str(resolved)) is not None:
+                        raise
+                    self.store.save_source(str(resolved), source['creator'], '', source['evidence'], True,
+                                           automation_source_id=source['id'], only_if_new=True)
+                    rights = require_rights(self.store, str(resolved))
+                # Recheck stat after hashing: a growing file is never queued.
+                after = resolved.stat()
+                if (after.st_size,after.st_mtime_ns) != (stat.st_size,stat.st_mtime_ns): continue
+                digest = rights['sha256']
+                with self.store.connect() as db:
+                    duplicate = db.execute("SELECT 1 FROM automation_jobs WHERE id!=? AND digest=? AND status IN ('pending','processing','completed','interrupted')", (job_id,digest)).fetchone()
+                    db.execute("UPDATE automation_jobs SET digest=?,status=?,error='',updated_at=CURRENT_TIMESTAMP WHERE id=? AND status IN ('observing','awaiting_authorization','pending')", (digest, 'duplicate' if duplicate else 'pending',job_id))
+            except (PermissionError,OSError,ValueError):
+                with self.store.connect() as db:
+                    db.execute("UPDATE automation_jobs SET status='awaiting_authorization',digest=NULL,error='Approve this exact file in Clip Editor',updated_at=CURRENT_TIMESTAMP WHERE id=? AND status IN ('observing','awaiting_authorization','pending')", (job_id,))
+
+    def _source_error(self, source, error):
+        with self.store.connect() as db:
+            db.execute('''INSERT INTO automation_jobs(id,source_id,source_key,status,error) VALUES(?,?,?,?,?)
+                ON CONFLICT(source_key) DO UPDATE SET error=excluded.error,updated_at=CURRENT_TIMESTAMP''', (str(uuid.uuid4()),source['id'],'source:' + source['id'],'failed',error))
+
+    def process_next(self, output_dir, maximum=3, clip_duration=20, min_score=.1, cancelled=None, progress=None, generator=generate, downloader=acquire, cpu_threads=0, min_free_bytes=0, inspector=inspect_completed_video):
+        try:
+            with self.lock:
+                return self._process_next(output_dir, maximum, clip_duration, min_score, cancelled, progress, generator, downloader, cpu_threads, min_free_bytes, inspector)
+        except Timeout:
+            raise RuntimeError('Another automation worker is already running') from None
+
+    def _process_next(self, output_dir, maximum, clip_duration, min_score, cancelled, progress, generator, downloader, cpu_threads, min_free_bytes, inspector):
+        root = Path(output_dir).expanduser().resolve(strict=True)
+        if not root.is_dir(): raise ValueError('Choose an existing output folder')
+        if not isinstance(cpu_threads, int) or cpu_threads < 0 or min_free_bytes < 0:
+            raise ValueError('Invalid resource limits')
+        if shutil.disk_usage(root).free < min_free_bytes:
+            raise OSError('Output drive has less free space than the configured minimum')
+        if cancelled and cancelled(): raise InterruptedError('Automation stopped')
+        with self.store.connect() as db:
+            db.execute('BEGIN IMMEDIATE')
+            db.row_factory = sqlite3.Row
+            row = db.execute("SELECT j.*,s.kind,s.value,s.creator,s.evidence,s.enabled FROM automation_jobs j JOIN automation_sources s ON s.id=j.source_id WHERE j.status='pending' AND s.enabled=1 ORDER BY j.rowid LIMIT 1").fetchone()
+            if row is None: return None
+            job = dict(row)
+            db.execute("UPDATE automation_jobs SET status='processing',error='',updated_at=CURRENT_TIMESTAMP WHERE id=? AND status='pending'", (job['id'],))
+        def cancelled_or_disabled():
+            if cancelled and cancelled(): return True
+            with self.store.connect() as db:
+                current = db.execute('SELECT enabled FROM automation_sources WHERE id=?', (job['source_id'],)).fetchone()
+            return not current or not current[0]
+        try:
+            if cancelled_or_disabled(): raise InterruptedError('Automation stopped or source disabled')
+            if job['kind'] == 'youtube_video':
+                # Recheck exact-ID rights before even requesting metadata.
+                with self.store.connect() as db:
+                    permission = db.execute('SELECT creator,evidence,approved FROM youtube_permissions WHERE video_id=?', (youtube_id(job['value']),)).fetchone()
+                if permission != (job['creator'], job['evidence'], 1):
+                    raise PermissionError('Exact video permission was changed or revoked')
+                try:
+                    inspector(job['value'])
+                    if cancelled_or_disabled(): raise InterruptedError('Automation stopped or source disabled')
+                    # acquire rechecks authorization before downloading.
+                    path = downloader(self.store,job['value'],str(root))
+                except RuntimeError as exc:
+                    message = str(exc)
+                    transient = any(term in message.lower() for term in ('timed out', 'timeout', 'network', 'connection', 'temporarily unavailable', 'http error 429', 'http error 502', 'http error 503', 'http error 504'))
+                    if not transient: raise
+                    attempts = job['attempts'] + 1
+                    status = 'retry_wait' if attempts < 3 else 'failed'
+                    delay = 30 * (2 ** (attempts - 1))
+                    with self.store.connect() as db:
+                        db.execute("UPDATE automation_jobs SET status=?,attempts=?,next_retry=?,error=?,updated_at=CURRENT_TIMESTAMP WHERE id=?", (status, attempts, self.clock() + delay if status == 'retry_wait' else None, 'Temporary download failure; retry scheduled' if status == 'retry_wait' else 'Download failed after three attempts',job['id']))
+                    return None
+            else:
+                path = job['path']
+            rights = require_rights(self.store,path)
+            if job['digest'] and rights['sha256'] != job['digest']:
+                raise PermissionError('Approved file changed after discovery')
+            if cancelled_or_disabled(): raise InterruptedError('Automation stopped or source disabled')
+            if shutil.disk_usage(root).free < min_free_bytes:
+                raise OSError('Output drive has less free space than the configured minimum')
+            kwargs = {'cpu_threads': cpu_threads} if cpu_threads else {}
+            items = generator(self.store,path,str(root),maximum=maximum,clip_duration=clip_duration,min_score=min_score,cancelled=cancelled_or_disabled,progress=progress,**kwargs)
+            if not items: raise ValueError('No clips were generated')
+            with self.store.connect() as db:
+                db.execute("UPDATE automation_jobs SET path=?,digest=?,status='completed',error='',updated_at=CURRENT_TIMESTAMP WHERE id=?", (path,rights['sha256'],job['id']))
+            return items
+        except Exception as exc:
+            with self.store.connect() as db:
+                db.execute("UPDATE automation_jobs SET status=?,error=?,updated_at=CURRENT_TIMESTAMP WHERE id=?", ('interrupted' if isinstance(exc,InterruptedError) else 'failed',str(exc)[:500],job['id']))
+            raise

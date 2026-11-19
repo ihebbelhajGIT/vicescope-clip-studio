@@ -22,6 +22,7 @@ from app.youtube import YouTubeAccount
 from app.youtube_jobs import YouTubeJobs
 from app.youtube_ui import YouTubePanel
 from app.acquisition import youtube_id, authorize, acquire
+from app.automation_ui import AutomationPanel
 
 
 class Worker(QObject):
@@ -60,6 +61,7 @@ class Window(QMainWindow):
         self.nav = QListWidget(); self.nav.setFixedWidth(200)
         self.pages = QStackedWidget(); layout.addWidget(self.nav); layout.addWidget(self.pages, 1)
         self.dashboard(); self.discovery(); self.campaigns(); self.editor(); self.transcription()
+        self.automation_page()
         for name in ("Livestreams", "Analytics"):
             self.page(name, "Not implemented yet. No data or publishing actions are simulated.")
         self.review_page()
@@ -79,6 +81,11 @@ class Window(QMainWindow):
     def dashboard(self):
         v = self.page("Dashboard", "Local workspace overview. Source approval is specific to each file.")
         self.summary = QLabel(); v.addWidget(self.summary); self.refresh(); v.addStretch()
+
+    def automation_page(self):
+        v = self.page('Automation', 'Monitor sources and prepare unapproved clips while the application is open.')
+        self.automation_panel = AutomationPanel(self.store, self)
+        v.addWidget(self.automation_panel)
     def refresh(self):
         c = self.store.counts(); self.summary.setText(f"Sources: {c['sources']}    Campaigns: {c['campaigns']}")
     def discovery(self):
@@ -408,7 +415,7 @@ class Window(QMainWindow):
         QMessageBox.warning(self, "Operation failed", message)
 
     def closeEvent(self, event):
-        if self.threads:
+        if self.threads or (hasattr(self, 'automation_panel') and self.automation_panel.thread is not None):
             QMessageBox.warning(self, "Processing", "Wait for background operations to finish before closing."); event.ignore()
         else:
             from PySide6.QtCore import QUrl

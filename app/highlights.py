@@ -59,7 +59,7 @@ def rank_candidates(duration: float, audio: Sequence[tuple[float, float]],
     return candidates[:limit]
 
 
-def analyze_audio(store, source: str, words: list[dict], clip_duration: float = 20.0):
+def analyze_audio(store, source: str, words: list[dict], clip_duration: float = 20.0, cpu_threads: int = 0):
     """Extract one RMS measurement per second and rank review candidates."""
     import re
     import subprocess
@@ -70,9 +70,11 @@ def analyze_audio(store, source: str, words: list[dict], clip_duration: float = 
 
     before = require_rights(store, source)
     duration = float(probe(Path(source))["format"]["duration"])
-    cmd = [tool_path("ffmpeg"), "-nostdin", "-hide_banner", "-loglevel", "error", "-i", str(Path(source).resolve()), "-vn", "-af", "aresample=16000,asetnsamples=n=16000:p=0,astats=metadata=1:reset=1,ametadata=print:file=-", "-f", "null", "-"]
+    if not isinstance(cpu_threads, int) or cpu_threads < 0: raise ValueError('Invalid CPU thread count')
+    limits = ['-threads', str(cpu_threads), '-filter_threads', str(cpu_threads)] if cpu_threads else []
+    cmd = [tool_path("ffmpeg"), "-nostdin", "-hide_banner", "-loglevel", "error", *limits, "-i", str(Path(source).resolve()), "-vn", "-af", "aresample=16000,asetnsamples=n=16000:p=0,astats=metadata=1:reset=1,ametadata=print:file=-", "-f", "null", "-"]
     result = subprocess.run(cmd, capture_output=True, check=True, timeout=3600, **process_options())
-    scenes_cmd = [tool_path("ffmpeg"), "-nostdin", "-hide_banner", "-loglevel", "info", "-i", str(Path(source).resolve()), "-an", "-vf", "select=gt(scene\\,0.3),showinfo", "-f", "null", "-"]
+    scenes_cmd = [tool_path("ffmpeg"), "-nostdin", "-hide_banner", "-loglevel", "info", *limits, "-i", str(Path(source).resolve()), "-an", "-vf", "select=gt(scene\\,0.3),showinfo", "-f", "null", "-"]
     scene_result = subprocess.run(scenes_cmd, capture_output=True, check=True, timeout=3600, **process_options())
     scenes = [float(match) for match in re.findall(r"showinfo[^\n]*pts_time:\s*([\d.]+)", scene_result.stderr)]
     after = require_rights(store, source)

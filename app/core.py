@@ -18,7 +18,7 @@ def discover(query: str, limit: int = 20):
     return [{"title": e.get("title") or "Unknown", "creator": e.get("channel") or e.get("uploader") or "Unknown", "url": e.get("webpage_url") or ("https://www.youtube.com/watch?v=" + e["id"] if e.get("id") else ""), "views": e.get("view_count"), "duration": e.get("duration"), "live_status": e.get("live_status") or "unknown", "footage": "Unverified", "authorization": "Not established"} for e in entries if e]
 
 
-def transcribe(path: str, model: str = "base"):
+def transcribe(path: str, model: str = "base", cpu_threads: int = 0):
     _, cache = application_paths()
     models = cache / "models"
     models.mkdir(parents=True, exist_ok=True)
@@ -28,7 +28,10 @@ def transcribe(path: str, model: str = "base"):
     from ctranslate2 import get_supported_compute_types
     from faster_whisper import WhisperModel
     compute_type = "int8" if "int8" in get_supported_compute_types("cpu") else "float32"
-    engine = WhisperModel(model, device="cpu", compute_type=compute_type, download_root=str(models))
+    if not isinstance(cpu_threads, int) or cpu_threads < 0:
+        raise ValueError('CPU threads must be a nonnegative integer')
+    thread_options = {'cpu_threads': cpu_threads} if cpu_threads else {}
+    engine = WhisperModel(model, device="cpu", compute_type=compute_type, download_root=str(models), **thread_options)
     segments, _ = engine.transcribe(path, word_timestamps=True, vad_filter=True)
     return [{"start": w.start, "end": w.end, "text": w.word.strip(), "probability": w.probability} for segment in segments for w in (segment.words or []) if w.probability >= 0.5]
 
@@ -37,6 +40,13 @@ def require_rights(store, source: str):
     record = store.source(source)
     if not record or not record["approved"] or not record["permission_evidence"].strip():
         raise PermissionError("Publication export requires explicit approval and evidence for this exact source")
+    if record.get('automation_source_id'):
+        with store.connect() as db:
+            grant = db.execute('SELECT kind,value,creator,evidence,enabled,auto_approve FROM automation_sources WHERE id=?', (record['automation_source_id'],)).fetchone()
+        if (not grant or grant[0] != 'folder' or not grant[4] or not grant[5]
+                or Path(record['path']).parent != Path(grant[1])
+                or grant[2:4] != (record['creator'], record['permission_evidence'])):
+            raise PermissionError('Folder permission was changed, disabled, or revoked')
     prefix = 'https://www.youtube.com/watch?v='
     video_id = record.get('youtube_video_id')
     if video_id:

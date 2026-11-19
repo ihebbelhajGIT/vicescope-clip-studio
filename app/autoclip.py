@@ -17,7 +17,7 @@ def non_overlapping(candidates, maximum=3, min_score=0.1):
     return selected
 
 
-def generate(store, source, output_root, maximum=3, min_score=0.1, transcriber=transcribe, clip_duration=20.0, progress=None, cancelled=None):
+def generate(store, source, output_root, maximum=3, min_score=0.1, transcriber=transcribe, clip_duration=20.0, progress=None, cancelled=None, cpu_threads=0):
     def report(value, message):
         if progress: progress(value, message)
     def check_cancel():
@@ -28,13 +28,14 @@ def generate(store, source, output_root, maximum=3, min_score=0.1, transcriber=t
     report(0, 'Checking source permission')
     rights = require_rights(store, source)
     report(10, 'Transcribing source')
-    words = transcriber(source)
+    if not isinstance(cpu_threads, int) or cpu_threads < 0: raise ValueError('Invalid CPU thread count')
+    words = transcriber(source, cpu_threads=cpu_threads) if cpu_threads and transcriber is transcribe else transcriber(source)
     check_cancel()
     after = require_rights(store, source)
     if rights['sha256'] != after['sha256']: raise PermissionError('Source changed during transcription')
     if not words: raise ValueError('No reliable speech found; review this source manually')
     report(30, 'Analyzing audio and scenes')
-    candidates = non_overlapping(analyze_audio(store, source, words, clip_duration), maximum, min_score)
+    candidates = non_overlapping(analyze_audio(store, source, words, clip_duration, cpu_threads), maximum, min_score)
     check_cancel()
     if not candidates: raise ValueError('No candidates met the minimum score; review this source manually')
     root = Path(output_root).resolve()
@@ -48,7 +49,7 @@ def generate(store, source, output_root, maximum=3, min_score=0.1, transcriber=t
         metadata = {'title': f'A moment from {creator}', 'description': f'Credit: {creator}\n{rights["source_url"]}'.strip(), 'hashtags': ['#Shorts']}
         destination = root / ('short-' + uuid.uuid4().hex)
         result = export_bundle(store, source, candidate.start, candidate.end, str(destination), words,
-                               f'A moment from {creator}', metadata['title'], metadata['description'], mark_complete=False)
+                               f'A moment from {creator}', metadata['title'], metadata['description'], mark_complete=False, cpu_threads=cpu_threads)
         item_id = queue.add(result['job_id'], candidate.score, candidate.explanation, metadata, mark_completed=True)
         results.append(item_id)
     report(100, 'Clips ready for review')
