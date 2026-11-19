@@ -50,7 +50,7 @@ class ReviewQueue:
             if 'parent_item_id' not in columns:
                 db.execute('ALTER TABLE review_items ADD COLUMN parent_item_id TEXT')
 
-    def add(self, job_id, score, explanation, metadata, parent_item_id=None):
+    def add(self, job_id, score, explanation, metadata, parent_item_id=None, mark_completed=False):
         item_id = str(uuid.uuid4())
         with self.store.connect() as db:
             row = db.execute('SELECT output_path FROM exports WHERE job_id=?', (job_id,)).fetchone()
@@ -58,6 +58,19 @@ class ReviewQueue:
             sync_package(Path(row[0]).parent / 'metadata.json', metadata)
             db.execute('INSERT INTO review_items(id,job_id,score,explanation,metadata,status,parent_item_id) VALUES(?,?,?,?,?,?,?)',
                        (item_id, job_id, score, explanation, canonical(metadata), 'ready', parent_item_id))
+            if mark_completed:
+                db.row_factory = sqlite3.Row
+                row = db.execute('''SELECT r.*, e.output_path, e.output_sha256, j.source_id, j.source_path,
+                    j.source_sha256, j.start, j.end FROM review_items r JOIN exports e ON e.job_id=r.job_id
+                    JOIN clip_jobs j ON j.id=r.job_id WHERE r.id=?''', (item_id,)).fetchone()
+                item = dict(row)
+                self.validate(item)
+                directory = Path(item['output_path']).parent
+                provenance = json.loads((directory / 'provenance.json').read_text(encoding='utf-8'))
+                if any(provenance.get(k) != item[v] for k, v in (('job_id', 'job_id'), ('source_sha256', 'source_sha256'), ('output_sha256', 'output_sha256'))):
+                    raise PermissionError('Export provenance does not match the review record')
+                db.execute('CREATE TABLE IF NOT EXISTS completed_packages (job_id TEXT PRIMARY KEY, directory TEXT NOT NULL, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)')
+                db.execute('INSERT INTO completed_packages(job_id,directory) VALUES(?,?)', (job_id, str(directory)))
         return item_id
 
     def list(self):
@@ -122,6 +135,16 @@ class ReviewQueue:
         with self.store.connect() as db:
             changed = db.execute("UPDATE review_items SET status='superseded', approved_output_hash=NULL, approved_metadata_hash=NULL WHERE id=? AND status != 'superseded'", (item_id,))
             if not changed.rowcount: raise ValueError('Review item not found or already superseded')
+
+    def supersede_if_unchanged(self, original):
+        with self.store.connect() as db:
+            changed = db.execute("""UPDATE review_items SET status='superseded', approved_output_hash=NULL,
+                approved_metadata_hash=NULL WHERE id=? AND status=? AND metadata=? AND
+                approved_output_hash IS ? AND approved_metadata_hash IS ?""",
+                (original['id'], original['status'], original['metadata'],
+                 original['approved_output_hash'], original['approved_metadata_hash']))
+            if not changed.rowcount:
+                raise ValueError('Original review changed during regeneration; review both versions')
 
     def is_approved(self, item_id):
         item = self.get(item_id)

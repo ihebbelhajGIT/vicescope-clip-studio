@@ -4,10 +4,11 @@ import json
 import logging
 import os
 import sys
+import threading
 from pathlib import Path
 
 from PySide6.QtCore import QObject, QThread, Signal
-from PySide6.QtWidgets import (QApplication, QCheckBox, QComboBox, QDoubleSpinBox, QFileDialog, QFormLayout, QHBoxLayout, QInputDialog, QLabel, QLineEdit, QListWidget, QMainWindow, QMessageBox, QProgressBar, QPushButton, QStackedWidget, QTableWidget, QTableWidgetItem, QTextEdit, QVBoxLayout, QWidget)
+from PySide6.QtWidgets import (QApplication, QCheckBox, QComboBox, QDoubleSpinBox, QFileDialog, QFormLayout, QHBoxLayout, QInputDialog, QLabel, QLineEdit, QListWidget, QMainWindow, QMessageBox, QProgressBar, QPushButton, QSpinBox, QStackedWidget, QTableWidget, QTableWidgetItem, QTextEdit, QVBoxLayout, QWidget)
 from app.core import discover, transcribe, require_rights
 from app.storage import Store
 from app.video import export_bundle, tool_path
@@ -21,6 +22,7 @@ from app.acquisition import youtube_id, authorize, acquire
 class Worker(QObject):
     finished = Signal(object)
     failed = Signal(str)
+    progress = Signal(int, str)
     def __init__(self, fn):
         super().__init__()
         self.fn = fn
@@ -109,7 +111,13 @@ class Window(QMainWindow):
         self.layout = QComboBox(); self.layout.addItem("Center crop", "center"); self.layout.addItem("Blurred background", "blur"); form.addRow("Layout", self.layout)
         self.hook = QLineEdit(); form.addRow("Opening hook", self.hook)
         self.title = QLineEdit(); self.description = QTextEdit(); form.addRow("Title", self.title); form.addRow("Description", self.description)
-        auto = QPushButton("Generate Shorts automatically"); auto.clicked.connect(self.generate_shorts); v.addWidget(auto)
+        self.clip_count = QSpinBox(); self.clip_count.setRange(1, 5); self.clip_count.setValue(3)
+        self.clip_duration = QSpinBox(); self.clip_duration.setRange(1, 180); self.clip_duration.setValue(20); self.clip_duration.setSuffix(" seconds")
+        self.minimum_score = QDoubleSpinBox(); self.minimum_score.setRange(0, 1); self.minimum_score.setSingleStep(.05); self.minimum_score.setValue(.1)
+        form.addRow("Maximum clips", self.clip_count); form.addRow("Clip duration", self.clip_duration); form.addRow("Minimum highlight score", self.minimum_score)
+        self.auto_button = QPushButton("Generate Shorts automatically"); self.auto_button.clicked.connect(self.generate_shorts); v.addWidget(self.auto_button)
+        self.cancel_button = QPushButton("Cancel after current step"); self.cancel_button.setEnabled(False); self.cancel_button.clicked.connect(self.cancel_generation); v.addWidget(self.cancel_button)
+        self.progress_label = QLabel(""); v.addWidget(self.progress_label)
         b = QPushButton("Render vertical MP4 and metadata"); b.clicked.connect(self.render_clip); v.addWidget(b)
         self.progress = QProgressBar(); self.progress.setRange(0, 1); self.progress.setValue(0); v.addWidget(self.progress); v.addStretch()
     def source_changed(self):
@@ -179,12 +187,24 @@ class Window(QMainWindow):
         directory = QFileDialog.getExistingDirectory(self, "Choose a folder for generated clips")
         if not directory: return
         source = self.source.text()
-        self.progress.setRange(0, 0)
+        maximum = self.clip_count.value(); duration = self.clip_duration.value(); score = self.minimum_score.value()
+        self.progress.setRange(0, 100); self.progress.setValue(0)
+        self.generation_cancel = threading.Event()
+        self.auto_button.setEnabled(False); self.cancel_button.setEnabled(True)
         def completed(items):
-            self.progress.setRange(0, 1); self.progress.setValue(1)
+            self.progress.setRange(0, 100); self.progress.setValue(100)
             self.refresh_review()
             QMessageBox.information(self, "Ready for review", f"Generated {len(items)} clip(s). Nothing was uploaded.")
-        self.background(lambda: generate(self.store, source, directory), completed)
+        self.background(lambda report, cancelled: generate(self.store, source, directory, maximum=maximum, min_score=score, clip_duration=duration, progress=report, cancelled=cancelled), completed, self.generation_cancel)
+
+    def cancel_generation(self):
+        self.generation_cancel.set()
+        self.progress_label.setText('Cancellation requested; waiting for the current step to finish')
+        self.cancel_button.setEnabled(False)
+
+    def update_generation_progress(self, value, message):
+        self.progress.setValue(value)
+        self.progress_label.setText(message)
 
     def review_page(self):
         v = self.page("Ready for Review", "Review each clip and its metadata before approving a private upload. Upload is not implemented.")
@@ -351,11 +371,16 @@ class Window(QMainWindow):
                     self.transcript.selectRow(row); break
             except (AttributeError, ValueError): pass
 
-    def background(self, fn, done):
-        thread = QThread(self); worker = Worker(fn); worker.moveToThread(thread)
+    def background(self, fn, done, generation_cancel=None):
+        thread = QThread(self)
+        worker = Worker((lambda: fn(worker.progress.emit, generation_cancel.is_set)) if generation_cancel else fn)
+        worker.moveToThread(thread)
+        worker.progress.connect(self.update_generation_progress)
         thread.started.connect(worker.run); worker.finished.connect(done); worker.failed.connect(self.show_error)
         worker.finished.connect(thread.quit); worker.failed.connect(thread.quit); worker.finished.connect(worker.deleteLater); worker.failed.connect(worker.deleteLater)
         thread.finished.connect(lambda: self.threads.remove((thread, worker))); thread.finished.connect(thread.deleteLater)
+        if generation_cancel:
+            thread.finished.connect(lambda: (self.auto_button.setEnabled(True), self.cancel_button.setEnabled(False)))
         self.threads.append((thread, worker)); thread.start()
     def show_error(self, message):
         self.refresh_review()

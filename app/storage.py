@@ -40,6 +40,12 @@ class Store:
             if "sha256" not in columns:
                 db.execute("ALTER TABLE sources ADD COLUMN sha256 TEXT")
                 db.execute("UPDATE sources SET approved=0")
+            if "youtube_video_id" not in columns:
+                db.execute("ALTER TABLE sources ADD COLUMN youtube_video_id TEXT")
+                if db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='youtube_permissions'").fetchone():
+                    db.execute("""UPDATE sources SET youtube_video_id=substr(source_url,33)
+                        WHERE source_url='https://www.youtube.com/watch?v=' || substr(source_url,33)
+                        AND EXISTS (SELECT 1 FROM youtube_permissions WHERE video_id=substr(source_url,33))""")
 
     @contextmanager
     def connect(self):
@@ -50,7 +56,7 @@ class Store:
         finally:
             db.close()
 
-    def save_source(self, path: str, creator: str, source_url: str, evidence: str, approved: bool):
+    def save_source(self, path: str, creator: str, source_url: str, evidence: str, approved: bool, youtube_video_id: str | None = None):
         resolved = Path(path).expanduser().resolve(strict=True)
         if not resolved.is_file():
             raise ValueError("Select a local video file")
@@ -58,7 +64,14 @@ class Store:
             raise ValueError("Permission evidence is required for approval")
         digest = file_hash(resolved)
         with self.connect() as db:
-            db.execute("INSERT INTO sources(path,creator,source_url,permission_evidence,approved,sha256) VALUES(?,?,?,?,?,?) ON CONFLICT(path) DO UPDATE SET creator=excluded.creator,source_url=excluded.source_url,permission_evidence=excluded.permission_evidence,approved=excluded.approved,sha256=excluded.sha256", (str(resolved), creator.strip(), source_url.strip(), evidence.strip(), int(approved), digest))
+            old = db.execute("SELECT id,creator,source_url,permission_evidence,approved,sha256 FROM sources WHERE path=?", (str(resolved),)).fetchone()
+            current = (creator.strip(), source_url.strip(), evidence.strip(), int(approved), digest)
+            if old and old[1:] != current:
+                exists = db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='review_items'").fetchone()
+                if exists:
+                    db.execute("""UPDATE review_items SET status='ready', approved_output_hash=NULL, approved_metadata_hash=NULL
+                        WHERE status='approved_private' AND job_id IN (SELECT id FROM clip_jobs WHERE source_id=?)""", (old[0],))
+            db.execute("INSERT INTO sources(path,creator,source_url,permission_evidence,approved,sha256,youtube_video_id) VALUES(?,?,?,?,?,?,?) ON CONFLICT(path) DO UPDATE SET creator=excluded.creator,source_url=excluded.source_url,permission_evidence=excluded.permission_evidence,approved=excluded.approved,sha256=excluded.sha256,youtube_video_id=COALESCE(excluded.youtube_video_id,sources.youtube_video_id)", (str(resolved), creator.strip(), source_url.strip(), evidence.strip(), int(approved), digest, youtube_video_id))
 
     def source(self, path: str):
         with self.connect() as db:

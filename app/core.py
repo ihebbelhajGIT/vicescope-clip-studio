@@ -27,6 +27,16 @@ def require_rights(store, source: str):
     record = store.source(source)
     if not record or not record["approved"] or not record["permission_evidence"].strip():
         raise PermissionError("Publication export requires explicit approval and evidence for this exact source")
+    prefix = 'https://www.youtube.com/watch?v='
+    video_id = record.get('youtube_video_id')
+    if video_id:
+        if record['source_url'] != prefix + video_id:
+            raise PermissionError('YouTube source URL no longer matches the authorized video')
+        with store.connect() as db:
+            exists = db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='youtube_permissions'").fetchone()
+            permission = db.execute('SELECT creator,evidence,approved FROM youtube_permissions WHERE video_id=?', (video_id,)).fetchone() if exists else None
+        if permission != (record['creator'], record['permission_evidence'], 1):
+            raise PermissionError('YouTube video permission was changed or revoked')
     try:
         matches = bool(record.get("sha256")) and file_hash(Path(source)) == record["sha256"]
     except OSError as exc:

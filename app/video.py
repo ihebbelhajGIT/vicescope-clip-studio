@@ -126,7 +126,7 @@ def prepare_package(store, result: dict, destination: str, description: str = ""
     return path
 
 
-def export_bundle(store, source: str, start: float, end: float, destination: str, words: list[dict], hook: str, title: str, description: str, layout: str = "center"):
+def export_bundle(store, source: str, start: float, end: float, destination: str, words: list[dict], hook: str, title: str, description: str, layout: str = "center", mark_complete: bool = True):
     """Create a new directory; failures leave a clearly incomplete directory for review."""
     target = Path(destination).resolve()
     target.mkdir(parents=False, exist_ok=False)
@@ -136,9 +136,10 @@ def export_bundle(store, source: str, start: float, end: float, destination: str
         record = {"job_id": result["job_id"], "source_sha256": result["source_sha256"], "output_sha256": result["output_sha256"], "start": start, "end": end, "source_url": result["source_url"], "creator": result["creator"], "layout": layout}
         with (target / "provenance.json").open("x", encoding="utf-8") as out:
             json.dump(record, out, ensure_ascii=False, indent=2)
-        with store.connect() as db:
-            db.execute("CREATE TABLE IF NOT EXISTS completed_packages (job_id TEXT PRIMARY KEY, directory TEXT NOT NULL, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)")
-            db.execute("INSERT INTO completed_packages(job_id, directory) VALUES(?,?)", (result["job_id"], str(target)))
+        if mark_complete:
+            with store.connect() as db:
+                db.execute("CREATE TABLE IF NOT EXISTS completed_packages (job_id TEXT PRIMARY KEY, directory TEXT NOT NULL, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)")
+                db.execute("INSERT INTO completed_packages(job_id, directory) VALUES(?,?)", (result["job_id"], str(target)))
         return result
     except Exception as exc:
         raise RuntimeError(f"Export incomplete. Files, if any, are in {target}: {exc}") from exc

@@ -59,7 +59,7 @@ def rank_candidates(duration: float, audio: Sequence[tuple[float, float]],
     return candidates[:limit]
 
 
-def analyze_audio(store, source: str, words: list[dict]):
+def analyze_audio(store, source: str, words: list[dict], clip_duration: float = 20.0):
     """Extract one RMS measurement per second and rank review candidates."""
     import re
     import subprocess
@@ -85,4 +85,6 @@ def analyze_audio(store, source: str, words: list[dict]):
         if line.startswith("lavfi.astats.Overall.RMS_level=") and current_time is not None:
             level = float(line.split("=", 1)[1])
             if math.isfinite(level): levels.append((current_time, max(0.0, min(1.0, (level + 60.0) / 60.0))))
-    return rank_candidates(duration, levels, scenes, words, window=min(20.0, duration))
+    if not math.isfinite(clip_duration) or not 1 <= clip_duration <= 180:
+        raise ValueError('Clip duration must be between 1 and 180 seconds')
+    return rank_candidates(duration, levels, scenes, words, window=min(clip_duration, duration), limit=1000)
