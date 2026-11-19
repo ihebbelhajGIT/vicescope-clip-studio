@@ -7,14 +7,15 @@ import sys
 from pathlib import Path
 
 from PySide6.QtCore import QObject, QThread, Signal
-from PySide6.QtWidgets import (QApplication, QCheckBox, QComboBox, QDoubleSpinBox, QFileDialog, QFormLayout, QHBoxLayout, QLabel, QLineEdit, QListWidget, QMainWindow, QMessageBox, QProgressBar, QPushButton, QStackedWidget, QTableWidget, QTableWidgetItem, QTextEdit, QVBoxLayout, QWidget)
+from PySide6.QtWidgets import (QApplication, QCheckBox, QComboBox, QDoubleSpinBox, QFileDialog, QFormLayout, QHBoxLayout, QInputDialog, QLabel, QLineEdit, QListWidget, QMainWindow, QMessageBox, QProgressBar, QPushButton, QStackedWidget, QTableWidget, QTableWidgetItem, QTextEdit, QVBoxLayout, QWidget)
 from app.core import discover, transcribe, require_rights
 from app.storage import Store
 from app.video import export_bundle, tool_path
 from app.preview import VideoPreview
 from app.highlights import analyze_audio
-from app.autoclip import generate
+from app.autoclip import generate, regenerate
 from app.review import ReviewQueue
+from app.acquisition import youtube_id, authorize, acquire
 
 
 class Worker(QObject):
@@ -94,6 +95,7 @@ class Window(QMainWindow):
         form = QFormLayout(); v.addLayout(form)
         self.source = QLineEdit(); browse = QPushButton("Choose local video"); browse.clicked.connect(self.pick_source)
         form.addRow(browse, self.source)
+        download = QPushButton("Import an authorized YouTube video"); download.clicked.connect(self.import_youtube); v.addWidget(download)
         self.creator = QLineEdit(); self.url = QLineEdit(); self.evidence = QLineEdit(); self.approved = QCheckBox("I explicitly approve publication use of this exact source")
         self.source.textChanged.connect(self.source_changed)
         form.addRow("Creator", self.creator); form.addRow("Source URL", self.url); form.addRow("Permission evidence", self.evidence); form.addRow(self.approved)
@@ -119,6 +121,29 @@ class Window(QMainWindow):
             from PySide6.QtCore import QUrl
             self.preview.player.stop(); self.preview.player.setSource(QUrl())
             if self.source.text() and Path(self.source.text()).is_file(): self.preview.load(str(Path(self.source.text()).resolve()))
+
+    def import_youtube(self):
+        url, ok = QInputDialog.getText(self, "YouTube URL", "HTTPS URL for the exact video:")
+        if not ok: return
+        try: video_id = youtube_id(url)
+        except ValueError as exc:
+            QMessageBox.warning(self, "Video URL", str(exc)); return
+        creator, ok = QInputDialog.getText(self, "Source creator", "Creator name:")
+        if not ok: return
+        evidence, ok = QInputDialog.getText(self, "Permission evidence", "Where is permission recorded for this exact video?")
+        if not ok: return
+        directory = QFileDialog.getExistingDirectory(self, "Choose a folder for the authorized download")
+        if not directory: return
+        decision = QMessageBox.question(self, "Approve this source", f"Do you have permission to download and process the YouTube video {video_id} for your Shorts?\n\nEvidence: {evidence}")
+        if decision != QMessageBox.StandardButton.Yes: return
+        try: authorize(self.store, url, creator, evidence)
+        except ValueError as exc:
+            QMessageBox.warning(self, "Permission", str(exc)); return
+        def complete(path):
+            self.source.setText(path); self.creator.setText(creator); self.url.setText('https://www.youtube.com/watch?v=' + video_id)
+            self.evidence.setText(evidence); self.approved.setChecked(True); self.refresh()
+            QMessageBox.information(self, "Source imported", "Download complete and source hash recorded. You can now generate Shorts.")
+        self.background(lambda: acquire(self.store, url, directory), complete)
 
     def pick_source(self):
         path = QFileDialog.getOpenFileName(self, "Select local video")[0]
@@ -170,7 +195,7 @@ class Window(QMainWindow):
         self.review_title = QLineEdit(); self.review_description = QTextEdit(); self.review_tags = QLineEdit()
         form.addRow("Title", self.review_title); form.addRow("Description", self.review_description); form.addRow("Hashtags", self.review_tags)
         row = QHBoxLayout(); v.addLayout(row)
-        for label, callback in (("Save metadata", self.save_review_metadata), ("Approve private upload", self.approve_review), ("Reject", self.reject_review), ("Open file", self.open_review_file)):
+        for label, callback in (("Save metadata", self.save_review_metadata), ("Approve private upload", self.approve_review), ("Reject", self.reject_review), ("Regenerate", self.regenerate_review), ("Open file", self.open_review_file)):
             button = QPushButton(label); button.clicked.connect(callback); row.addWidget(button)
         self.refresh_review()
 
@@ -224,6 +249,16 @@ class Window(QMainWindow):
             return
         self.review_decision('approved_private')
     def reject_review(self): self.review_decision('rejected')
+    def regenerate_review(self):
+        item = self.selected_review()
+        if not item: return
+        hook, ok = QInputDialog.getText(self, "Regenerate clip", "Opening hook for the new version:")
+        if not ok: return
+        self.progress.setRange(0, 0)
+        def complete(new_id):
+            self.progress.setRange(0, 1); self.progress.setValue(1); self.refresh_review()
+            QMessageBox.information(self, "New version", "A new unapproved version is ready for review.")
+        self.background(lambda: regenerate(self.store, item['id'], hook), complete)
     def open_review_file(self):
         from PySide6.QtCore import QUrl
         from PySide6.QtGui import QDesktopServices
@@ -323,6 +358,7 @@ class Window(QMainWindow):
         thread.finished.connect(lambda: self.threads.remove((thread, worker))); thread.finished.connect(thread.deleteLater)
         self.threads.append((thread, worker)); thread.start()
     def show_error(self, message):
+        self.refresh_review()
         self.progress.setRange(0, 1); self.progress.setValue(0)
         QMessageBox.warning(self, "Operation failed", message)
 

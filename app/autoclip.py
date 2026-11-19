@@ -40,3 +40,22 @@ def generate(store, source, output_root, maximum=3, min_score=0.1, transcriber=t
         item_id = queue.add(result['job_id'], candidate.score, candidate.explanation, metadata)
         results.append(item_id)
     return results
+
+
+def regenerate(store, item_id, hook, transcriber=transcribe):
+    """Re-render the selected time range as a new, unapproved version."""
+    import json
+    queue = ReviewQueue(store)
+    item = queue.get(item_id)
+    rights = queue.validate(item)
+    queue.supersede(item_id)
+    source = item['source_path']
+    words = transcriber(source)
+    after = require_rights(store, source)
+    if after['sha256'] != rights['sha256']: raise PermissionError('Source changed during transcription')
+    if not words: raise ValueError('No reliable speech found; manual review required')
+    metadata = json.loads(item['metadata'])
+    destination = Path(item['output_path']).parent.parent / ('short-' + uuid.uuid4().hex)
+    result = export_bundle(store, source, item['start'], item['end'], str(destination), words, hook,
+                           metadata['title'], metadata['description'])
+    return queue.add(result['job_id'], item['score'], item['explanation'], metadata, parent_item_id=item_id)
