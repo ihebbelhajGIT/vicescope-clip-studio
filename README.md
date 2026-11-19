@@ -1,15 +1,11 @@
-# ViceScope Clip Studio
+﻿# ViceScope Clip Studio
 
-This is an early, incomplete local desktop foundation, not a finished clipping application. It does not require Claude. Install Python 3.11 or newer and FFmpeg separately, then run `powershell -ExecutionPolicy Bypass -File scripts/install.ps1`. If the Python launcher has a different version, create `.venv` with your Python executable and install `requirements.txt`. Launch with `.\.venv\Scripts\python.exe -m app.main` and run tests with `.\.venv\Scripts\python.exe -m pytest`.
+An experimental Windows desktop application for source-rights tracking and local video clipping. It does not upload or publish videos. Python 3.11+, FFmpeg and FFprobe are required; install dependencies with `.venv\Scripts\python.exe -m pip install -r requirements.txt` and launch with `.venv\Scripts\python.exe -m app.main`.
 
-Search uses yt-dlp metadata; search results are not verified gameplay or authorization. Save a campaign brief, choose a local source, enter permission evidence, and explicitly approve the exact source. The Highlight Finder can request transcription using faster-whisper; its model may download on first use. The metadata draft action is disabled until exported clips have verifiable source provenance. Review the source, rights, MP4 and generated JSON before any manual publishing. No publishing is performed by the app. Data and logs live under `%LOCALAPPDATA%\ViceScopeClipStudio`.
+Choose a local source in Clip Editor, enter permission evidence, explicitly approve and save it. Set start and end times, hook, title and description. Highlight Finder can transcribe the authorized source; the first run may download a model. Render creates a new 1080×1920 H.264/AAC MP4 and a JSON draft beside it. FFmpeg and FFprobe are detected from `.venv/ffmpeg-dist/*/bin` or PATH. Settings displays the detected paths. No media or models are included in this repository.
 
-Implemented in source: local SQLite source/campaign records, YouTube search adapter, transcription adapter, rights gate and disabled metadata draft, background workers, and a basic Qt interface. Not yet implemented: actual highlight selection, video playback, cutting, subtitles, video rendering, source-to-output provenance, reliable live discovery, cancellation, queue, analytics, packaging as an executable, or complete campaign rules. Metadata packaging accepts a manually selected MP4 and cannot prove it derives from the approved source; verify it manually. The desktop application has not launched in the current environment because PySide6 is unavailable; FFmpeg is also missing. Six dependency-free unit tests pass; see docs/development.md. Do not use it as a production publishing workflow.
+The draft records hashes and attribution; retain the original source and evidence. Review the clip and rights manually before publishing. An MIT software license does not grant rights to footage.
 
-For a future executable, after implementing and testing the missing features, install PyInstaller in the virtual environment and evaluate `pyinstaller --windowed --name ViceScopeClipStudio app/main.py`; Qt plugins, model files, FFmpeg and startup imports require further packaging work and validation.
+Run tests with `.venv\Scripts\python.exe -m pytest -q`. Synthetic integration tests cover generated source, approval, rendering, probe inspection and metadata. This is an experimental workflow: automatic candidate detection, video preview, subtitle editing, presets, detailed progress, export history, and an output copy inside a package directory are not implemented. Transcript and real-world media quality have not been verified. The metadata draft points to the MP4 instead of copying it. Existing general-purpose package preparation remains disabled.
 
-
-Source approvals are bound to a SHA-256 hash. Replacing a source requires renewed approval; old records are revoked on migration. See docs/development.md for environment and verification status.
-
-
-A standalone candidate-ranking component and persisted source/segment snapshots are present but are not connected to the UI or an export workflow.
+See `docs/architecture.md` for the earlier audit and `THIRD_PARTY_NOTICES.md` for attribution. The FFmpeg binaries and model weights are separately distributed components with their own licenses.
