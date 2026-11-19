@@ -1,4 +1,4 @@
-﻿"""Local, rights-gated video rendering and output verification."""
+"""Local, rights-gated video rendering and output verification."""
 from __future__ import annotations
 
 import json
@@ -63,7 +63,7 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
     return header + "\n".join(lines) + "\n"
 
 
-def render(store, source: str, start: float, end: float, destination: str, words: list[dict], hook: str, title: str):
+def render(store, source: str, start: float, end: float, destination: str, words: list[dict], hook: str, title: str, layout: str = "center"):
     job = create_job(store, source, start, end)
     rights = verify_job(store, job)
     target = Path(destination).resolve()
@@ -80,7 +80,12 @@ def render(store, source: str, start: float, end: float, destination: str, words
         directory = Path(tmp)
         (directory / "captions.ass").write_text(subtitles_ass(words, start, end, hook, rights["creator"]), encoding="utf-8")
         intermediate = directory / "render.mp4"
-        vf = "scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,setsar=1,subtitles=captions.ass"
+        if layout == "center":
+            vf = "scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,setsar=1,subtitles=captions.ass"
+        elif layout == "blur":
+            vf = "split=2[bg][fg];[bg]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,boxblur=20:5[back];[fg]scale=1080:1920:force_original_aspect_ratio=decrease[front];[back][front]overlay=(W-w)/2:(H-h)/2,setsar=1,subtitles=captions.ass"
+        else:
+            raise ValueError("Unknown layout")
         cmd = [tool_path("ffmpeg"), "-hide_banner", "-loglevel", "error", "-nostdin", "-ss", str(start), "-i", str(Path(source).resolve()), "-t", str(end-start), "-vf", vf, "-r", "30", "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p", "-c:a", "aac", "-movflags", "+faststart", str(intermediate)]
         subprocess.run(cmd, cwd=directory, capture_output=True, text=True, check=True, timeout=3600)
         verify_job(store, job)
@@ -119,3 +124,21 @@ def prepare_package(store, result: dict, destination: str, description: str = ""
     with path.open("x", encoding="utf-8") as out:
         json.dump(data, out, ensure_ascii=False, indent=2)
     return path
+
+
+def export_bundle(store, source: str, start: float, end: float, destination: str, words: list[dict], hook: str, title: str, description: str, layout: str = "center"):
+    """Create a new directory; failures leave a clearly incomplete directory for review."""
+    target = Path(destination).resolve()
+    target.mkdir(parents=False, exist_ok=False)
+    try:
+        result = render(store, source, start, end, str(target / "clip.mp4"), words, hook, title, layout)
+        prepare_package(store, result, str(target / "metadata.json"), description)
+        record = {"job_id": result["job_id"], "source_sha256": result["source_sha256"], "output_sha256": result["output_sha256"], "start": start, "end": end, "source_url": result["source_url"], "creator": result["creator"], "layout": layout}
+        with (target / "provenance.json").open("x", encoding="utf-8") as out:
+            json.dump(record, out, ensure_ascii=False, indent=2)
+        with store.connect() as db:
+            db.execute("CREATE TABLE IF NOT EXISTS completed_packages (job_id TEXT PRIMARY KEY, directory TEXT NOT NULL, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)")
+            db.execute("INSERT INTO completed_packages(job_id, directory) VALUES(?,?)", (result["job_id"], str(target)))
+        return result
+    except Exception as exc:
+        raise RuntimeError(f"Export incomplete. Files, if any, are in {target}: {exc}") from exc

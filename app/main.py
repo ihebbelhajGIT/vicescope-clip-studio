@@ -6,10 +6,12 @@ import sys
 from pathlib import Path
 
 from PySide6.QtCore import QObject, QThread, Signal
-from PySide6.QtWidgets import (QApplication, QCheckBox, QDoubleSpinBox, QFileDialog, QFormLayout, QHBoxLayout, QLabel, QLineEdit, QListWidget, QMainWindow, QMessageBox, QProgressBar, QPushButton, QStackedWidget, QTextEdit, QVBoxLayout, QWidget)
+from PySide6.QtWidgets import (QApplication, QCheckBox, QComboBox, QDoubleSpinBox, QFileDialog, QFormLayout, QHBoxLayout, QLabel, QLineEdit, QListWidget, QMainWindow, QMessageBox, QProgressBar, QPushButton, QStackedWidget, QTableWidget, QTableWidgetItem, QTextEdit, QVBoxLayout, QWidget)
 from app.core import discover, transcribe, require_rights
 from app.storage import Store
-from app.video import render, prepare_package, tool_path
+from app.video import export_bundle, tool_path
+from app.preview import VideoPreview
+from app.highlights import analyze_audio
 
 
 class Worker(QObject):
@@ -41,8 +43,9 @@ class Window(QMainWindow):
         self.nav = QListWidget(); self.nav.setFixedWidth(200)
         self.pages = QStackedWidget(); layout.addWidget(self.nav); layout.addWidget(self.pages, 1)
         self.dashboard(); self.discovery(); self.campaigns(); self.editor(); self.transcription()
-        for name in ("Livestreams", "Export Queue", "Analytics"):
+        for name in ("Livestreams", "Analytics"):
             self.page(name, "Not implemented yet. No data or publishing actions are simulated.")
+        self.export_history()
         self.diagnostics()
         self.nav.currentRowChanged.connect(self.pages.setCurrentIndex); self.nav.setCurrentRow(0)
         self.setStyleSheet("QWidget{background:#111522;color:#e7eaf3;font-size:14px} QListWidget,QLineEdit,QTextEdit{background:#1b2131;border:1px solid #30394d;border-radius:6px;padding:8px} QPushButton{background:#794ee8;border:0;border-radius:6px;padding:10px;color:white} QPushButton:hover{background:#916afa} QLabel#heading{font-size:25px;font-weight:bold}")
@@ -93,6 +96,10 @@ class Window(QMainWindow):
         self.start_time = QDoubleSpinBox(); self.end_time = QDoubleSpinBox()
         for field in (self.start_time, self.end_time): field.setRange(0, 86400); field.setDecimals(2)
         self.end_time.setValue(15); form.addRow("Start (seconds)", self.start_time); form.addRow("End (seconds)", self.end_time)
+        self.preview = VideoPreview(); v.addWidget(self.preview)
+        self.preview.selection_start.connect(self.start_time.setValue)
+        self.preview.selection_end.connect(self.end_time.setValue)
+        self.layout = QComboBox(); self.layout.addItem("Center crop", "center"); self.layout.addItem("Blurred background", "blur"); form.addRow("Layout", self.layout)
         self.hook = QLineEdit(); form.addRow("Opening hook", self.hook)
         self.title = QLineEdit(); self.description = QTextEdit(); form.addRow("Title", self.title); form.addRow("Description", self.description)
         b = QPushButton("Render vertical MP4 and metadata"); b.clicked.connect(self.render_clip); v.addWidget(b)
@@ -100,7 +107,12 @@ class Window(QMainWindow):
     def source_changed(self):
         self.approved.setChecked(False)
         self.words = []
-        if hasattr(self, "transcript"): self.transcript.clear()
+        if hasattr(self, "transcript"): self.transcript.setRowCount(0)
+        if hasattr(self, "candidates"): self.candidates.clear()
+        if hasattr(self, "preview"):
+            from PySide6.QtCore import QUrl
+            self.preview.player.stop(); self.preview.player.setSource(QUrl())
+            if self.source.text() and Path(self.source.text()).is_file(): self.preview.load(str(Path(self.source.text()).resolve()))
 
     def pick_source(self):
         path = QFileDialog.getOpenFileName(self, "Select local video")[0]
@@ -115,20 +127,36 @@ class Window(QMainWindow):
             self.store.save_source(self.source.text(), self.creator.text(), self.url.text(), self.evidence.text(), self.approved.isChecked()); self.refresh(); QMessageBox.information(self, "Source", "Source saved.")
         except Exception as e: QMessageBox.warning(self, "Source", str(e))
     def render_clip(self):
-        path = QFileDialog.getSaveFileName(self, "Save new MP4", "clip.mp4", "MP4 (*.mp4)")[0]
+        path = QFileDialog.getSaveFileName(self, "Choose a new export directory name", "short-export")[0]
         if not path: return
         source, start, end = self.source.text(), self.start_time.value(), self.end_time.value()
         hook, title, description = self.hook.text(), self.title.text(), self.description.toPlainText()
-        words = list(getattr(self, "words", []))
+        layout = self.layout.currentData()
+        try: words = self.edited_words()
+        except ValueError as exc:
+            QMessageBox.warning(self, "Subtitle error", str(exc)); return
         self.progress.setRange(0, 0)
         def work():
-            result = render(self.store, source, start, end, path, words, hook, title)
-            prepare_package(self.store, result, str(Path(path).with_suffix(".json")), description)
-            return result
+            return export_bundle(self.store, source, start, end, path, words, hook, title, description, layout)
         def completed(result):
             self.progress.setRange(0, 1); self.progress.setValue(1)
-            QMessageBox.information(self, "Export complete", f"Saved {result['output_path']} and metadata. Nothing was published.")
+            self.refresh_history()
+            QMessageBox.information(self, "Export complete", f"Saved {result['output_path']}, metadata, and provenance. Nothing was published.")
         self.background(work, completed)
+
+    def export_history(self):
+        v = self.page("Export Queue", "Only packages with video, metadata and provenance are listed as completed.")
+        self.history = QListWidget(); v.addWidget(self.history)
+        button = QPushButton("Refresh"); button.clicked.connect(self.refresh_history); v.addWidget(button)
+        self.refresh_history()
+
+    def refresh_history(self):
+        self.history.clear()
+        with self.store.connect() as db:
+            exists = db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='completed_packages'").fetchone()
+            if exists:
+                for job_id, directory, created in db.execute("SELECT job_id, directory, created_at FROM completed_packages ORDER BY created_at DESC"):
+                    self.history.addItem(f"{created} | {job_id} | {directory}")
 
     def diagnostics(self):
         v = self.page("Settings", "Media tool diagnostics")
@@ -139,18 +167,68 @@ class Window(QMainWindow):
         v.addStretch()
 
     def transcription(self):
-        v = self.page("Highlight Finder", "Transcribe the selected local source. The model may be downloaded on first use. Highlight scoring and subtitle editing are not implemented.")
+        v = self.page("Highlight Finder", "Analyze audio and optional transcript to suggest moments. Select a result for review; it is not a verified highlight.")
         b = QPushButton("Transcribe source"); b.clicked.connect(self.start_transcription); v.addWidget(b)
-        self.transcript = QTextEdit(); self.transcript.setReadOnly(True); v.addWidget(self.transcript)
+        analyze = QPushButton("Analyze audio and rank candidates"); analyze.clicked.connect(self.analyze_highlights); v.addWidget(analyze)
+        self.candidates = QListWidget(); self.candidates.itemClicked.connect(self.choose_candidate); v.addWidget(self.candidates)
+        self.transcript = QTableWidget(0, 3); self.transcript.setHorizontalHeaderLabels(["Start (s)", "End (s)", "Text"]); v.addWidget(self.transcript)
+        self.preview.player.positionChanged.connect(self.highlight_subtitle)
+    def analyze_highlights(self):
+        source = self.source.text()
+        words = list(getattr(self, "words", []))
+        self.background(lambda: analyze_audio(self.store, source, words), lambda rows: self.show_candidates(rows) if self.source.text() == source else None)
+
+    def show_candidates(self, candidates):
+        self.candidate_values = candidates
+        self.candidates.clear()
+        for item in candidates:
+            self.candidates.addItem(f"{item.start:.1f}?{item.end:.1f}s | {item.score:.2f} | {item.explanation}")
+
+    def choose_candidate(self, item):
+        candidate = self.candidate_values[self.candidates.row(item)]
+        self.start_time.setValue(candidate.start); self.end_time.setValue(candidate.end)
+        self.preview.player.setPosition(int(candidate.start * 1000))
+
     def start_transcription(self):
         source = self.source.text()
         def work():
-            require_rights(self.store, source)
-            return transcribe(source)
-        self.background(work, self.show_transcript)
+            before = require_rights(self.store, source)
+            words = transcribe(source)
+            after = require_rights(self.store, source)
+            if before["sha256"] != after["sha256"]:
+                raise PermissionError("Source changed during transcription")
+            return words
+        def completed(words):
+            if self.source.text() == source: self.show_transcript(words)
+        self.background(work, completed)
     def show_transcript(self, words):
         self.words = words
-        self.transcript.setPlainText("\n".join(f"{w['start']:.2f}-{w['end']:.2f} {w['text']}" for w in words))
+        self.transcript.setRowCount(len(words))
+        for row, word in enumerate(words):
+            for col, value in enumerate((word["start"], word["end"], word["text"])):
+                self.transcript.setItem(row, col, QTableWidgetItem(str(value)))
+
+    def edited_words(self):
+        words = []
+        for row in range(self.transcript.rowCount()):
+            try:
+                start = float(self.transcript.item(row, 0).text())
+                end = float(self.transcript.item(row, 1).text())
+                text = self.transcript.item(row, 2).text()
+            except (ValueError, AttributeError):
+                raise ValueError(f"Invalid subtitle at row {row + 1}") from None
+            if not (0 <= start < end < 864000): raise ValueError(f"Invalid subtitle timing at row {row + 1}")
+            words.append({"start": start, "end": end, "text": text})
+        return words
+
+    def highlight_subtitle(self, position):
+        seconds = position / 1000
+        for row in range(self.transcript.rowCount()):
+            try:
+                start = float(self.transcript.item(row, 0).text()); end = float(self.transcript.item(row, 1).text())
+                if start <= seconds < end:
+                    self.transcript.selectRow(row); break
+            except (AttributeError, ValueError): pass
 
     def background(self, fn, done):
         thread = QThread(self); worker = Worker(fn); worker.moveToThread(thread)
@@ -165,7 +243,10 @@ class Window(QMainWindow):
     def closeEvent(self, event):
         if self.threads:
             QMessageBox.warning(self, "Processing", "Wait for background operations to finish before closing."); event.ignore()
-        else: event.accept()
+        else:
+            from PySide6.QtCore import QUrl
+            self.preview.player.stop(); self.preview.player.setSource(QUrl())
+            event.accept()
 
 
 def main():

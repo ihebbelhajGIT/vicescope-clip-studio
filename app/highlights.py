@@ -51,3 +51,29 @@ def rank_candidates(duration: float, audio: Sequence[tuple[float, float]],
         start += step
     candidates.sort(key=lambda item: (-item.score, item.start))
     return candidates[:limit]
+
+
+def analyze_audio(store, source: str, words: list[dict]):
+    """Extract one RMS measurement per second and rank review candidates."""
+    import re
+    import subprocess
+    from pathlib import Path
+    from app.core import require_rights
+    from app.video import probe, tool_path
+
+    before = require_rights(store, source)
+    duration = float(probe(Path(source))["format"]["duration"])
+    cmd = [tool_path("ffmpeg"), "-nostdin", "-hide_banner", "-loglevel", "error", "-i", str(Path(source).resolve()), "-vn", "-af", "aresample=16000,asetnsamples=n=16000:p=0,astats=metadata=1:reset=1,ametadata=print:file=-", "-f", "null", "-"]
+    result = subprocess.run(cmd, capture_output=True, text=True, check=True, timeout=3600)
+    after = require_rights(store, source)
+    if before["sha256"] != after["sha256"]:
+        raise PermissionError("Source changed during analysis")
+    levels = []
+    current_time = None
+    for line in result.stdout.splitlines():
+        match = re.search(r"pts_time:([\d.]+)", line)
+        if match: current_time = float(match.group(1))
+        if line.startswith("lavfi.astats.Overall.RMS_level=") and current_time is not None:
+            level = float(line.split("=", 1)[1])
+            if math.isfinite(level): levels.append((current_time, max(0.0, min(1.0, (level + 60.0) / 60.0))))
+    return rank_candidates(duration, levels, [], words, window=min(20.0, duration))
