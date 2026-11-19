@@ -3,10 +3,10 @@ from __future__ import annotations
 
 import re
 import subprocess
-import sys
 import uuid
 from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
+from app.platform_support import process_options, ytdlp_command
 from app.video import probe, tool_path
 from app.core import require_rights
 
@@ -71,9 +71,9 @@ def acquire(store, url: str, root: str, runner=subprocess.run):
             pass
     directory = root_path / ('source-' + uuid.uuid4().hex)
     directory.mkdir()
-    cmd = [sys.executable, '-m', 'yt_dlp', '--ignore-config', '--no-cookies', '--no-playlist', '--no-cache-dir', '--no-progress', '--no-write-info-json', '--ffmpeg-location', tool_path('ffmpeg'), '-f', 'bv*[ext=mp4]+ba[ext=m4a]/b[ext=mp4]/b', '--merge-output-format', 'mp4', '-o', str(directory / 'source.%(ext)s'), '--print', 'after_move:filepath', canonical_url]
+    cmd = ytdlp_command('--ignore-config', '--no-cookies', '--no-playlist', '--no-cache-dir', '--no-progress', '--no-write-info-json', '--ffmpeg-location', tool_path('ffmpeg'), '-f', 'bv*[ext=mp4]+ba[ext=m4a]/b[ext=mp4]/b', '--merge-output-format', 'mp4', '-o', str(directory / 'source.%(ext)s'), '--print', 'after_move:filepath', canonical_url)
     try:
-        result = runner(cmd, capture_output=True, text=True, encoding='utf-8', errors='replace', check=True, timeout=7200)
+        result = runner(cmd, capture_output=True, check=True, timeout=7200, **process_options(bundled_child=True))
     except subprocess.CalledProcessError as exc:
         detail = (exc.stderr or '').strip()[-600:]
         raise RuntimeError('YouTube import failed. The video may be unavailable, restricted, or unsupported. ' + detail) from exc

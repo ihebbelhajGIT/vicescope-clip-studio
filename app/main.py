@@ -6,10 +6,12 @@ import os
 import sys
 import threading
 from pathlib import Path
+from logging.handlers import RotatingFileHandler
 
 from PySide6.QtCore import QObject, QThread, Signal
 from PySide6.QtWidgets import (QApplication, QCheckBox, QComboBox, QDoubleSpinBox, QFileDialog, QFormLayout, QHBoxLayout, QInputDialog, QLabel, QLineEdit, QListWidget, QMainWindow, QMessageBox, QProgressBar, QPushButton, QSpinBox, QStackedWidget, QTableWidget, QTableWidgetItem, QTextEdit, QVBoxLayout, QWidget)
 from app.core import discover, transcribe, require_rights
+from app.platform_support import application_paths, settings
 from app.storage import Store
 from app.video import export_bundle, tool_path
 from app.preview import VideoPreview
@@ -40,12 +42,15 @@ class Worker(QObject):
 class Window(QMainWindow):
     def __init__(self):
         super().__init__()
-        root = Path(os.environ.get("LOCALAPPDATA", str(Path.home()))) / "ViceScopeClipStudio"
+        root, _ = application_paths()
         root.mkdir(parents=True, exist_ok=True)
-        logging.basicConfig(filename=root / "app.log", level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+        if not logging.getLogger().handlers:
+            handler = RotatingFileHandler(root / "app.log", maxBytes=2 * 1024 * 1024, backupCount=2, encoding="utf-8")
+            logging.basicConfig(handlers=[handler], level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
         self.store = Store(root / "studio.sqlite3")
         self.review_queue = ReviewQueue(self.store)
-        account = YouTubeAccount(root / 'youtube-client.json', os.environ.get('VICESCOPE_YOUTUBE_CHANNEL_ID', '').strip())
+        channel_id = os.environ.get('VICESCOPE_YOUTUBE_CHANNEL_ID', settings().get('youtube_channel_id', '')).strip()
+        account = YouTubeAccount(root / 'youtube-client.json', channel_id)
         self.youtube_jobs = YouTubeJobs(self.review_queue, account)
         self.setWindowTitle("ViceScope Clip Studio")
         self.resize(1180, 760)
@@ -316,7 +321,7 @@ class Window(QMainWindow):
         v = self.page("Settings", "Media tool diagnostics")
         for name in ("ffmpeg", "ffprobe"):
             try: value = tool_path(name)
-            except FileNotFoundError: value = "Not found"
+            except FileNotFoundError as exc: value = str(exc)
             label = QLabel(f"{name}: {value}"); label.setWordWrap(True); v.addWidget(label)
         v.addStretch()
 
@@ -411,7 +416,14 @@ class Window(QMainWindow):
 
 
 def main():
-    app = QApplication(sys.argv); window = Window(); window.show(); return app.exec()
+    app = QApplication(sys.argv)
+    try:
+        window = Window()
+    except (ValueError, OSError) as exc:
+        QMessageBox.critical(None, "ViceScope startup", str(exc))
+        return 1
+    window.show()
+    return app.exec()
 
 if __name__ == "__main__":
     sys.exit(main())

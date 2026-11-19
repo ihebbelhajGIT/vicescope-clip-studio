@@ -2,7 +2,7 @@
 name = "vicescope-clip-studio"
 version = "0.1.0"
 requires-python = ">=3.11"
-dependencies = ["PySide6>=6.7,<7", "pydantic>=2.7,<3", "yt-dlp>=2025.1", "faster-whisper>=1.1,<2", "av>=11,<16", "google-auth-oauthlib>=1.2,<2", "keyring>=25,<26; sys_platform == 'win32'", "filelock>=3.16,<4"]
+dependencies = ["PySide6>=6.7,<7", "pydantic>=2.7,<3", "yt-dlp[default]>=2025.1", "faster-whisper>=1.1,<2", "av>=11,<16", "google-auth-oauthlib>=1.2,<2", "keyring>=25,<26; sys_platform == 'win32' or sys_platform == 'darwin'", "filelock>=3.16,<4"]
 [tool.pytest.ini_options]
 pythonpath = ["."]
 testpaths = ["tests"]

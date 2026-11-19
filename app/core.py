@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
-import sys
 from pathlib import Path
+from app.platform_support import application_paths, process_options, ytdlp_command
 from app.storage import file_hash
 
 
@@ -11,15 +12,24 @@ def discover(query: str, limit: int = 20):
     query = query.strip()
     if not query or not 1 <= limit <= 50:
         raise ValueError("Enter a search query and a limit from 1 to 50")
-    cmd = [sys.executable, "-m", "yt_dlp", "--ignore-config", "--no-playlist", "--flat-playlist", "--dump-single-json", f"ytsearch{limit}:{query}"]
-    result = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=90, check=True)
+    cmd = ytdlp_command("--ignore-config", "--no-playlist", "--flat-playlist", "--dump-single-json", f"ytsearch{limit}:{query}")
+    result = subprocess.run(cmd, capture_output=True, timeout=90, check=True, **process_options(bundled_child=True))
     entries = json.loads(result.stdout).get("entries") or []
     return [{"title": e.get("title") or "Unknown", "creator": e.get("channel") or e.get("uploader") or "Unknown", "url": e.get("webpage_url") or ("https://www.youtube.com/watch?v=" + e["id"] if e.get("id") else ""), "views": e.get("view_count"), "duration": e.get("duration"), "live_status": e.get("live_status") or "unknown", "footage": "Unverified", "authorization": "Not established"} for e in entries if e]
 
 
 def transcribe(path: str, model: str = "base"):
+    _, cache = application_paths()
+    models = cache / "models"
+    models.mkdir(parents=True, exist_ok=True)
+    # The Hub's Xet downloader maintains a separate cache from the model snapshots.
+    os.environ.setdefault("HF_XET_CACHE", str(cache / "huggingface-xet"))
+
+    from ctranslate2 import get_supported_compute_types
     from faster_whisper import WhisperModel
-    segments, _ = WhisperModel(model, device="cpu", compute_type="int8").transcribe(path, word_timestamps=True, vad_filter=True)
+    compute_type = "int8" if "int8" in get_supported_compute_types("cpu") else "float32"
+    engine = WhisperModel(model, device="cpu", compute_type=compute_type, download_root=str(models))
+    segments, _ = engine.transcribe(path, word_timestamps=True, vad_filter=True)
     return [{"start": w.start, "end": w.end, "text": w.word.strip(), "probability": w.probability} for segment in segments for w in (segment.words or []) if w.probability >= 0.5]
 
 

@@ -8,21 +8,13 @@ import subprocess
 import tempfile
 from pathlib import Path
 
+from app.platform_support import process_options, tool_path
 from app.provenance import create_job, verify_job
 from app.storage import file_hash
 
 
-def tool_path(name: str) -> str:
-    configured = Path(__file__).resolve().parent.parent / ".venv" / "ffmpeg-dist"
-    found = list(configured.glob(f"*/bin/{name}.exe")) if configured.exists() else []
-    executable = str(found[0]) if found else shutil.which(name)
-    if not executable:
-        raise FileNotFoundError(f"{name} was not found. Install FFmpeg and FFprobe or add them to PATH.")
-    return str(Path(executable).resolve())
-
-
 def probe(path: Path) -> dict:
-    result = subprocess.run([tool_path("ffprobe"), "-v", "error", "-show_streams", "-show_format", "-of", "json", str(path)], capture_output=True, text=True, check=True, timeout=60)
+    result = subprocess.run([tool_path("ffprobe"), "-v", "error", "-show_streams", "-show_format", "-of", "json", str(path)], capture_output=True, check=True, timeout=60, **process_options())
     return json.loads(result.stdout)
 
 
@@ -87,7 +79,7 @@ def render(store, source: str, start: float, end: float, destination: str, words
         else:
             raise ValueError("Unknown layout")
         cmd = [tool_path("ffmpeg"), "-hide_banner", "-loglevel", "error", "-nostdin", "-ss", str(start), "-i", str(Path(source).resolve()), "-t", str(end-start), "-vf", vf, "-r", "30", "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p", "-c:a", "aac", "-movflags", "+faststart", str(intermediate)]
-        subprocess.run(cmd, cwd=directory, capture_output=True, text=True, check=True, timeout=3600)
+        subprocess.run(cmd, cwd=directory, capture_output=True, check=True, timeout=3600, **process_options())
         verify_job(store, job)
         output = probe(intermediate)
         video = next((s for s in output["streams"] if s.get("codec_type") == "video"), {})

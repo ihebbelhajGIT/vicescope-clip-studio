@@ -16,6 +16,8 @@ from google.auth.transport.requests import AuthorizedSession
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
 
+from app.credentials import NativeVault
+
 SCOPE = 'https://www.googleapis.com/auth/youtube.force-ssl'
 API = 'https://www.googleapis.com/youtube/v3/'
 UPLOAD = 'https://www.googleapis.com/upload/youtube/v3/videos'
@@ -26,25 +28,6 @@ VIDEO_ID = re.compile(r'[A-Za-z0-9_-]{11}')
 
 class YouTubeError(RuntimeError):
     pass
-
-
-class WindowsVault:
-    service = 'ViceScopeClipStudio.YouTube'
-
-    def __init__(self):
-        from keyring.backends.Windows import WinVaultKeyring
-        self.backend = WinVaultKeyring()
-        self.backend.persist = 'local machine'
-
-    def get(self, key):
-        return self.backend.get_password(self.service, key)
-
-    def put(self, key, value):
-        self.backend.set_password(self.service, key, value)
-
-    def delete(self, key):
-        if self.get(key) is not None:
-            self.backend.delete_password(self.service, key)
 
 
 def callback_code(target, state):
@@ -122,7 +105,7 @@ def response_error(response):
 
 
 class YouTubeAccount:
-    def __init__(self, config_path, expected_channel, vault_factory=WindowsVault):
+    def __init__(self, config_path, expected_channel, vault_factory=NativeVault):
         self.config_path = config_path
         self.expected_channel = expected_channel
         self.vault_factory = vault_factory
@@ -131,11 +114,11 @@ class YouTubeAccount:
         try:
             return self.vault_factory()
         except Exception:
-            raise YouTubeError('Windows Credential Manager is unavailable.') from None
+            raise YouTubeError('The native credential store is unavailable. Unlock your OS credential store and retry.') from None
 
     def require_channel(self):
         if not CHANNEL_ID.fullmatch(self.expected_channel):
-            raise YouTubeError('Set VICESCOPE_YOUTUBE_CHANNEL_ID to the intended ViceScope channel ID.')
+            raise YouTubeError('Configure the intended ViceScope channel ID in settings.json or VICESCOPE_YOUTUBE_CHANNEL_ID.')
 
     def client_config(self):
         try:

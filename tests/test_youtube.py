@@ -301,7 +301,7 @@ def test_offscreen_review_actions(tmp_path, monkeypatch):
     from PySide6.QtWidgets import QApplication, QMessageBox, QPushButton, QWidget
     from app.main import Window
 
-    monkeypatch.setenv('LOCALAPPDATA', str(tmp_path))
+    monkeypatch.setenv('VICESCOPE_DATA_DIR', str(tmp_path / 'app-data'))
     monkeypatch.setenv('QT_QPA_PLATFORM', 'offscreen')
     app = QApplication.instance() or QApplication([])
 

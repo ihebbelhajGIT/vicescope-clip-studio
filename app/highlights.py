@@ -65,14 +65,15 @@ def analyze_audio(store, source: str, words: list[dict], clip_duration: float = 
     import subprocess
     from pathlib import Path
     from app.core import require_rights
+    from app.platform_support import process_options
     from app.video import probe, tool_path
 
     before = require_rights(store, source)
     duration = float(probe(Path(source))["format"]["duration"])
     cmd = [tool_path("ffmpeg"), "-nostdin", "-hide_banner", "-loglevel", "error", "-i", str(Path(source).resolve()), "-vn", "-af", "aresample=16000,asetnsamples=n=16000:p=0,astats=metadata=1:reset=1,ametadata=print:file=-", "-f", "null", "-"]
-    result = subprocess.run(cmd, capture_output=True, text=True, check=True, timeout=3600)
+    result = subprocess.run(cmd, capture_output=True, check=True, timeout=3600, **process_options())
     scenes_cmd = [tool_path("ffmpeg"), "-nostdin", "-hide_banner", "-loglevel", "info", "-i", str(Path(source).resolve()), "-an", "-vf", "select=gt(scene\\,0.3),showinfo", "-f", "null", "-"]
-    scene_result = subprocess.run(scenes_cmd, capture_output=True, text=True, check=True, timeout=3600)
+    scene_result = subprocess.run(scenes_cmd, capture_output=True, check=True, timeout=3600, **process_options())
     scenes = [float(match) for match in re.findall(r"showinfo[^\n]*pts_time:\s*([\d.]+)", scene_result.stderr)]
     after = require_rights(store, source)
     if before["sha256"] != after["sha256"]:

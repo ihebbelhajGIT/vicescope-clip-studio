@@ -1,10 +1,10 @@
 PySide6>=6.7,<7
 pydantic>=2.7,<3
-yt-dlp>=2025.1
+yt-dlp[default]>=2025.1
 faster-whisper>=1.1,<2
 pytest>=8,<10
 
 av>=11,<16
 google-auth-oauthlib>=1.2,<2
-keyring>=25,<26; sys_platform == "win32"
+keyring>=25,<26; sys_platform == "win32" or sys_platform == "darwin"
 filelock>=3.16,<4
