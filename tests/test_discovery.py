@@ -110,3 +110,49 @@ def test_disk_monitor_requests_cooperative_stop(tmp_path, monkeypatch):
         monitor.process_next(str(tmp_path), min_free_bytes=10, generator=generating)
     job, = monitor.list_jobs(); assert job['status'] == 'failed' and job['safe_retry'] == 0
     with pytest.raises(ValueError): monitor.retry_job(job['id'])
+
+
+def test_channel_scans_uploads_and_streams_and_deduplicates(tmp_path):
+    store = Store(tmp_path/'studio.sqlite'); monitor = Automation(store)
+    monitor.add_source('youtube_channel', 'UC'+'x'*22, 'Creator', 'Evidence')
+    calls = []
+    def discover(kind, value, maximum, streams):
+        calls.append((maximum, streams))
+        return ([{'id':'abcdefghijk','title':'upload'}, {'id':'abcdefghijL','title':'both'}]
+                if not streams else [{'id':'abcdefghijL','title':'both'}, {'id':'abcdefghijM','title':'archive','live_status':'was_live'}])
+    monitor.scan(maximum=4, streams=True, discoverer=discover)
+    assert calls == [(4, False), (4, True)]
+    assert len(monitor.list_jobs()) == 3
+    assert all(j['status'] == 'awaiting_authorization' for j in monitor.list_jobs())
+    assert monitor.list_sources()[0]['new_found'] == 3
+    again = Automation(store)
+    assert again.list_activity()[0]['event'] == 'discovery_completed'
+
+
+def test_approval_and_retries_survive_aging_out_of_results(tmp_path):
+    store = Store(tmp_path/'studio.sqlite'); monitor = Automation(store)
+    now = [100]; monitor.clock = lambda: now[0]
+    monitor.add_source('youtube_playlist', 'PLabcdefghijk', 'Creator', 'Evidence')
+    found = lambda *args: [{'id':'abcdefghijk'}]
+    empty = lambda *args: []
+    monitor.scan(discoverer=found)
+    authorize(store, 'https://youtu.be/abcdefghijk', 'Creator', 'Permission')
+    monitor.scan(discoverer=empty)
+    assert monitor.list_jobs()[0]['status'] == 'pending'
+    def fail(*args): raise RuntimeError('connection timeout')
+    monitor.process_next(str(tmp_path), inspector=lambda _: {}, downloader=fail, retry_backoff=7)
+    now[0] = 107; monitor.scan(discoverer=empty)
+    assert monitor.list_jobs()[0]['status'] == 'pending'
+    with store.connect() as db: db.execute('UPDATE youtube_permissions SET approved=0')
+    monitor.scan(discoverer=empty)
+    assert monitor.list_jobs()[0]['status'] == 'awaiting_authorization'
+
+
+def test_source_failure_is_resolved_and_later_failure_reappears(tmp_path):
+    store = Store(tmp_path/'studio.sqlite'); monitor = Automation(store)
+    monitor.add_source('youtube_playlist', 'PLabcdefghijk', 'Creator', 'Evidence')
+    def fail(*args): raise RuntimeError('Network unavailable')
+    monitor.scan(discoverer=fail); assert monitor.list_jobs()[0]['status'] == 'failed'
+    monitor.scan(discoverer=lambda *args: []); assert monitor.list_jobs()[0]['status'] == 'resolved'
+    monitor.scan(discoverer=fail); assert monitor.list_jobs()[0]['status'] == 'failed'
+    assert [x['event'] for x in monitor.list_activity()] == ['discovery_failed', 'discovery_completed', 'discovery_failed']

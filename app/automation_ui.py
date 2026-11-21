@@ -70,8 +70,8 @@ class AutomationPanel(QWidget):
         form.addRow('Clip duration', self.duration); form.addRow('Minimum score', self.score)
         form.addRow('CPU threads per task', self.cpu_threads); form.addRow('Minimum free disk before work', self.min_free)
         self.scan_limit = QSpinBox(); self.scan_limit.setRange(1, 100); self.scan_limit.setValue(20)
-        self.streams = QCheckBox('Monitor completed livestream recordings (channel streams tab)'); v.addWidget(self.streams)
-        form.addRow('Maximum videos scanned per source', self.scan_limit)
+        self.streams = QCheckBox('Also monitor completed livestream recordings (channel streams tab)'); v.addWidget(self.streams)
+        form.addRow('Maximum videos scanned per source tab', self.scan_limit)
         self.retry_limit = QSpinBox(); self.retry_limit.setRange(1, 10); self.retry_limit.setValue(3)
         self.retry_backoff = QSpinBox(); self.retry_backoff.setRange(1, 3600); self.retry_backoff.setValue(30); self.retry_backoff.setSuffix(' seconds')
         form.addRow('Download retry limit', self.retry_limit); form.addRow('Initial retry backoff', self.retry_backoff)
@@ -81,6 +81,8 @@ class AutomationPanel(QWidget):
             button = QPushButton(label); button.clicked.connect(handler); buttons.addWidget(button)
         self.status = QLabel('Stopped. Automation runs only while the app is open.'); self.status.setWordWrap(True); v.addWidget(self.status)
         self.jobs = QListWidget(); v.addWidget(self.jobs)
+        v.addWidget(QLabel('Recent automation activity'))
+        self.activity = QListWidget(); v.addWidget(self.activity)
         retry = QPushButton('Retry failed job'); retry.clicked.connect(self.retry_job); v.addWidget(retry)
         approve = QPushButton('Authorize selected exact video'); approve.clicked.connect(self.authorize_video); v.addWidget(approve)
         self.restore_settings(); self.refresh()
@@ -146,6 +148,9 @@ class AutomationPanel(QWidget):
         self.sources.clear()
         for row in self.source_rows:
             self.sources.addItem(f"{'Enabled' if row['enabled'] else 'Disabled'} | {row['kind']} | {row['creator']} | {row['value']} | Last checked: {row['last_checked'] or 'never'} | New: {row['new_found']} | Individual video permission required")
+        self.activity.clear()
+        for row in self.engine.list_activity():
+            self.activity.addItem(f"{row['created_at']} | {row['event']} | {row['detail']}")
         self.jobs.clear()
         self.job_rows = self.engine.list_jobs()[:200]
         for row in self.job_rows:

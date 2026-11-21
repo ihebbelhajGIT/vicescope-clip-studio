@@ -39,6 +39,9 @@ class Automation:
                     error TEXT NOT NULL DEFAULT '', discovered_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                     updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
                 CREATE TABLE IF NOT EXISTS automation_settings (id INTEGER PRIMARY KEY CHECK(id=1), value TEXT NOT NULL);
+                CREATE TABLE IF NOT EXISTS automation_activity (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT, source_id TEXT, job_id TEXT,
+                    event TEXT NOT NULL, detail TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
             ''')
             columns = {row[1] for row in db.execute('PRAGMA table_info(automation_jobs)')}
             if 'observed_at' not in columns:
@@ -117,7 +120,42 @@ class Automation:
             db.row_factory = sqlite3.Row
             return [dict(x) for x in db.execute('SELECT * FROM automation_jobs ORDER BY updated_at DESC, rowid DESC')]
 
+    def list_activity(self, limit=200):
+        with self.store.connect() as db:
+            db.row_factory = sqlite3.Row
+            return [dict(row) for row in db.execute(
+                'SELECT * FROM automation_activity ORDER BY id DESC LIMIT ?', (limit,))]
+
+    def _activity(self, event, detail='', source_id=None, job_id=None):
+        try:
+            with self.store.connect() as db:
+                db.execute('INSERT INTO automation_activity(source_id,job_id,event,detail) VALUES(?,?,?,?)',
+                           (source_id, job_id, event, str(detail)[:500]))
+        except sqlite3.Error:
+            # Logging is best effort and must never change a completed job's state.
+            pass
+
+    def _refresh_video_jobs(self):
+        # Previously discovered videos remain actionable after aging out of the first page.
+        with self.store.connect() as db:
+            if not db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='youtube_permissions'").fetchone():
+                return
+            rows = db.execute("""SELECT j.id,j.source_key,j.status,j.next_retry FROM automation_jobs j
+                JOIN automation_sources s ON s.id=j.source_id
+                WHERE s.enabled=1 AND s.kind IN ('youtube_channel','youtube_playlist')
+                AND j.status IN ('pending','awaiting_authorization','retry_wait')""").fetchall()
+            for job_id, key, status, retry in rows:
+                if not key.startswith('youtube:'): continue
+                rights = db.execute('SELECT approved FROM youtube_permissions WHERE video_id=?', (key[8:],)).fetchone()
+                allowed = bool(rights and rights[0])
+                if status == 'retry_wait' and allowed and retry is not None and retry > self.clock(): continue
+                target = 'pending' if allowed else 'awaiting_authorization'
+                if target != status:
+                    db.execute('UPDATE automation_jobs SET status=?,error=?,updated_at=CURRENT_TIMESTAMP WHERE id=?',
+                               (target, '' if allowed else 'Exact video permission required', job_id))
+
     def scan(self, maximum=20, streams=False, discoverer=discover_collection):
+        self._refresh_video_jobs()
         for source in self.list_sources():
             if not source['enabled']: continue
             if source['kind'] == 'youtube_video':
@@ -129,9 +167,12 @@ class Automation:
 
     def _observe_collection(self, source, maximum, streams, discoverer):
         try:
-            entries = discoverer(source['kind'], source['value'], maximum, streams)
+            entries = discoverer(source['kind'], source['value'], maximum, False)
+            if streams and source['kind'] == 'youtube_channel':
+                entries += discoverer(source['kind'], source['value'], maximum, True)
         except Exception as exc:
             self._source_error(source, 'Discovery failed: ' + str(exc)[:400])
+            self._activity('discovery_failed', str(exc), source['id'])
             return
         new = 0
         with self.store.connect() as db:
@@ -152,6 +193,8 @@ class Automation:
                     WHERE source_id=? AND source_key=? AND (status IN ('pending','awaiting_authorization') OR (status='retry_wait' AND (next_retry<=? OR ?=0)))""",
                     ('pending' if rights else 'awaiting_authorization', '' if rights else 'Exact video permission required',source['id'],key,self.clock(),int(bool(rights))))
             db.execute('UPDATE automation_sources SET last_checked=CURRENT_TIMESTAMP,new_found=? WHERE id=?', (new,source['id']))
+            db.execute("UPDATE automation_jobs SET status='resolved',error='',updated_at=CURRENT_TIMESTAMP WHERE source_key=? AND status='failed'", ('source:' + source['id'],))
+        self._activity('discovery_completed', f'{len(entries)} metadata entries checked; {new} new videos', source['id'])
 
     def _observe_youtube(self, source):
         video_id = youtube_id(source['value'])
@@ -224,7 +267,7 @@ class Automation:
     def _source_error(self, source, error):
         with self.store.connect() as db:
             db.execute('''INSERT INTO automation_jobs(id,source_id,source_key,status,error) VALUES(?,?,?,?,?)
-                ON CONFLICT(source_key) DO UPDATE SET error=excluded.error,updated_at=CURRENT_TIMESTAMP''', (str(uuid.uuid4()),source['id'],'source:' + source['id'],'failed',error))
+                ON CONFLICT(source_key) DO UPDATE SET status='failed',error=excluded.error,updated_at=CURRENT_TIMESTAMP''', (str(uuid.uuid4()),source['id'],'source:' + source['id'],'failed',error))
 
     def retry_job(self, job_id):
         """Retry only when generation never began, avoiding duplicate review clips."""
@@ -260,6 +303,7 @@ class Automation:
             if row is None: return None
             job = dict(row)
             db.execute("UPDATE automation_jobs SET status='processing',safe_retry=1,error='',updated_at=CURRENT_TIMESTAMP WHERE id=? AND status='pending'", (job['id'],))
+        self._activity('processing_started', job['source_key'], job['source_id'], job['id'])
         disk_low = threading.Event()
         disk_monitor_stop = threading.Event()
         def monitor_disk():
@@ -299,6 +343,7 @@ class Automation:
                     delay = retry_backoff * (2 ** (attempts - 1))
                     with self.store.connect() as db:
                         db.execute("UPDATE automation_jobs SET status=?,attempts=?,next_retry=?,error=?,updated_at=CURRENT_TIMESTAMP WHERE id=?", (status, attempts, self.clock() + delay if status == 'retry_wait' else None, 'Temporary download failure; retry scheduled' if status == 'retry_wait' else f'Download failed after {retry_limit} attempts',job['id']))
+                    self._activity(status, 'Temporary YouTube acquisition failure', job['source_id'], job['id'])
                     return None
             else:
                 path = job['path']
@@ -316,11 +361,13 @@ class Automation:
             if not items: raise ValueError('No clips were generated')
             with self.store.connect() as db:
                 db.execute("UPDATE automation_jobs SET path=?,digest=?,status='completed',error='',updated_at=CURRENT_TIMESTAMP WHERE id=?", (path,rights['sha256'],job['id']))
+            self._activity('completed', f'{len(items)} clips ready for review', job['source_id'], job['id'])
             return items
         except Exception as exc:
             if disk_low.is_set(): exc = OSError('Free disk space fell below the configured minimum during processing')
             with self.store.connect() as db:
                 db.execute("UPDATE automation_jobs SET status=?,error=?,updated_at=CURRENT_TIMESTAMP WHERE id=?", ('interrupted' if isinstance(exc,InterruptedError) else 'failed',str(exc)[:500],job['id']))
+            self._activity('interrupted' if isinstance(exc, InterruptedError) else 'failed', str(exc), job['source_id'], job['id'])
             raise exc
         finally:
             disk_monitor_stop.set()
