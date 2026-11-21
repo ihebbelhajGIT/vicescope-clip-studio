@@ -80,7 +80,7 @@ class AutomationPanel(QWidget):
         for label, handler in (('Start / resume', self.start), ('Pause', self.pause), ('Stop', self.stop), ('Run now', self.run_now), ('Run discovery now', self.run_discovery)):
             button = QPushButton(label); button.clicked.connect(handler); buttons.addWidget(button)
         self.status = QLabel('Stopped. Automation runs only while the app is open.'); self.status.setWordWrap(True); v.addWidget(self.status)
-        self.jobs = QListWidget(); v.addWidget(self.jobs)
+        self.jobs = QListWidget(); self.jobs.setAccessibleName('Automation jobs'); v.addWidget(self.jobs)
         v.addWidget(QLabel('Recent automation activity'))
         self.activity = QListWidget(); v.addWidget(self.activity)
         retry = QPushButton('Retry failed job'); retry.clicked.connect(self.retry_job); v.addWidget(retry)
@@ -157,8 +157,13 @@ class AutomationPanel(QWidget):
         for row in self.job_rows:
             self.jobs.addItem(f"{row['status']} | {row['path'] or row['source_key']} | {row['error']}")
 
+    def selected_job_index(self):
+        # Accessibility clients may select an item without setting Qt's current row.
+        selected = self.jobs.selectedItems()
+        return self.jobs.row(selected[0]) if selected else self.jobs.currentRow()
+
     def authorize_video(self):
-        index = self.jobs.currentRow()
+        index = self.selected_job_index()
         if index < 0 or index >= len(self.job_rows): return
         job = self.job_rows[index]
         url = job.get('video_url')
@@ -174,7 +179,7 @@ class AutomationPanel(QWidget):
         except Exception as exc: QMessageBox.warning(self, 'Authorization', str(exc))
 
     def reconcile_job(self):
-        index = self.jobs.currentRow()
+        index = self.selected_job_index()
         if index < 0 or index >= len(self.job_rows): return
         try:
             count = self.engine.reconcile_job(self.job_rows[index]['id'])
@@ -184,7 +189,7 @@ class AutomationPanel(QWidget):
             QMessageBox.warning(self, 'Manual inspection required', str(exc))
 
     def retry_job(self):
-        index = self.jobs.currentRow()
+        index = self.selected_job_index()
         if index < 0 or index >= len(self.job_rows): return
         try:
             self.engine.retry_job(self.job_rows[index]['id'])

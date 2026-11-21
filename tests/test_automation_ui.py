@@ -31,3 +31,23 @@ panel.close(); app.processEvents()
 '''
     env = os.environ.copy(); env['QT_QPA_PLATFORM'] = 'offscreen'
     subprocess.run([sys.executable, '-c', code, str(tmp_path)], env=env, check=True, timeout=30)
+
+
+def test_selected_job_without_current_row_is_actionable(tmp_path):
+    code = r'''
+import sys
+from pathlib import Path
+from PySide6.QtWidgets import QApplication
+from app.storage import Store
+from app.automation_ui import AutomationPanel
+app=QApplication([]); panel=AutomationPanel(Store(Path(sys.argv[1])/'test.sqlite'))
+panel.job_rows=[{'id':'chosen'}]; panel.jobs.addItem('interrupted')
+panel.jobs.item(0).setSelected(True)
+assert panel.jobs.currentRow() == -1
+called=[]; panel.engine.reconcile_job=lambda item_id: called.append(item_id) or 1
+panel.reconcile_job()
+assert called==['chosen']
+panel.close()
+'''
+    env = os.environ.copy(); env['QT_QPA_PLATFORM'] = 'offscreen'
+    subprocess.run([sys.executable, '-c', code, str(tmp_path)], env=env, check=True, timeout=30)
