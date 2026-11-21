@@ -156,3 +156,51 @@ def test_source_failure_is_resolved_and_later_failure_reappears(tmp_path):
     monitor.scan(discoverer=lambda *args: []); assert monitor.list_jobs()[0]['status'] == 'resolved'
     monitor.scan(discoverer=fail); assert monitor.list_jobs()[0]['status'] == 'failed'
     assert [x['event'] for x in monitor.list_activity()] == ['discovery_failed', 'discovery_completed', 'discovery_failed']
+
+
+def test_reconcile_real_synthetic_export_without_duplicate_review(tmp_path):
+    import json
+    import subprocess
+    from pathlib import Path
+    from app.autoclip import generate
+    from app.review import ReviewQueue
+    from app.video import tool_path
+    store = Store(tmp_path/'studio.sqlite'); monitor = Automation(store, settle_seconds=0)
+    folder = tmp_path/'input'; folder.mkdir(); source = folder/'source.mp4'
+    subprocess.run([tool_path('ffmpeg'), '-hide_banner', '-loglevel', 'error', '-f', 'lavfi', '-i', 'testsrc2=s=160x90:r=30:d=2', '-f', 'lavfi', '-i', 'sine=duration=2', '-c:v', 'libx264', '-c:a', 'aac', '-shortest', str(source)], check=True)
+    store.save_source(str(source), 'Synthetic creator', '', 'Generated test footage', True)
+    monitor.add_source('folder', str(folder), 'Synthetic creator', 'Generated test footage')
+    monitor.scan(); monitor.scan(); job = monitor.list_jobs()[0]
+    with store.connect() as db:
+        db.execute("UPDATE automation_jobs SET status='interrupted',path=?,digest=? WHERE id=?", (str(source),store.source(str(source))['sha256'],job['id']))
+    items = generate(store,str(source),str(tmp_path),maximum=1,clip_duration=2,transcriber=lambda _: [{'start':.1,'end':.8,'text':'wow'}],automation_job_id=job['id'],cpu_threads=2)
+    queue = ReviewQueue(store); item = queue.get(items[0]); output = Path(item['output_path'])
+    with store.connect() as db:
+        db.execute('DELETE FROM completed_packages WHERE job_id=?', (item['job_id'],))
+        db.execute('DELETE FROM review_items WHERE id=?', (items[0],))
+    original_media = output.read_bytes()
+    output.write_bytes(original_media + b'tampered')
+    with pytest.raises(ValueError,match='uncertain'): monitor.reconcile_job(job['id'])
+    output.write_bytes(original_media)
+    metadata = output.parent/'metadata.json'; original = metadata.read_bytes()
+    content = json.loads(original); content['output_sha256'] = '0'*64
+    metadata.write_text(json.dumps(content),encoding='utf-8')
+    with pytest.raises(ValueError,match='uncertain'): monitor.reconcile_job(job['id'])
+    assert queue.list() == [] and monitor.list_jobs()[0]['status'] == 'interrupted'
+    metadata.write_bytes(original)
+    assert monitor.reconcile_job(job['id']) == 1
+    recovered, = queue.list(); assert recovered['status'] == 'ready' and recovered['approved_output_hash'] is None
+    queue.validate(recovered); assert monitor.list_jobs()[0]['status'] == 'completed'
+    with pytest.raises(ValueError,match='uncertain'): monitor.reconcile_job(job['id'])
+    assert len(queue.list()) == 1
+
+
+def test_reconcile_incomplete_plan_requires_manual_inspection(tmp_path):
+    store = Store(tmp_path/'studio.sqlite'); monitor = Automation(store)
+    monitor.add_source('youtube_video','https://youtu.be/abcdefghijk','Creator','Evidence'); monitor.scan()
+    job = monitor.list_jobs()[0]
+    with store.connect() as db:
+        db.execute("UPDATE automation_jobs SET status='interrupted' WHERE id=?", (job['id'],))
+        db.execute('INSERT INTO automation_plans VALUES(?,?)', (job['id'],2))
+    with pytest.raises(ValueError, match='manual'): monitor.reconcile_job(job['id'])
+    assert monitor.list_jobs()[0]['status'] == 'interrupted'

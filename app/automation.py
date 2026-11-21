@@ -42,6 +42,12 @@ class Automation:
                 CREATE TABLE IF NOT EXISTS automation_activity (
                     id INTEGER PRIMARY KEY AUTOINCREMENT, source_id TEXT, job_id TEXT,
                     event TEXT NOT NULL, detail TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
+                CREATE TABLE IF NOT EXISTS automation_plans (
+                    job_id TEXT PRIMARY KEY, expected_count INTEGER NOT NULL);
+                CREATE TABLE IF NOT EXISTS automation_outputs (
+                    job_id TEXT NOT NULL, ordinal INTEGER NOT NULL, directory TEXT NOT NULL UNIQUE,
+                    score REAL NOT NULL, explanation TEXT NOT NULL, metadata TEXT NOT NULL,
+                    PRIMARY KEY(job_id,ordinal));
             ''')
             columns = {row[1] for row in db.execute('PRAGMA table_info(automation_jobs)')}
             if 'observed_at' not in columns:
@@ -281,6 +287,71 @@ class Automation:
         except Timeout:
             raise RuntimeError('Wait for the current automation worker to finish') from None
 
+    def reconcile_job(self, job_id):
+        """Recover only complete, provenance-checked outputs from a recorded plan."""
+        from app.provenance import ClipJob, verify_job
+        from app.review import ReviewQueue
+        from app.storage import file_hash
+        from app.video import probe
+        try:
+            with self.lock:
+                with self.store.connect() as db:
+                    db.row_factory = sqlite3.Row
+                    job = db.execute("SELECT * FROM automation_jobs WHERE id=? AND status IN ('failed','interrupted')", (job_id,)).fetchone()
+                    plan = db.execute('SELECT expected_count FROM automation_plans WHERE job_id=?', (job_id,)).fetchone()
+                    rows = db.execute('SELECT * FROM automation_outputs WHERE job_id=? ORDER BY ordinal', (job_id,)).fetchall()
+                if not job or not plan or plan[0] < 1 or len(rows) != plan[0]:
+                    raise ValueError('Recovery is uncertain: the recorded clip plan is incomplete; inspect partial outputs manually')
+                queue = ReviewQueue(self.store)
+                recovered = []
+                for row in rows:
+                    directory = Path(row['directory'])
+                    if directory.is_symlink() or not directory.is_dir():
+                        raise ValueError('Recovery is uncertain: a planned output folder is missing')
+                    try:
+                        metadata = json.loads((directory / 'metadata.json').read_text(encoding='utf-8'))
+                        provenance = json.loads((directory / 'provenance.json').read_text(encoding='utf-8'))
+                        planned = json.loads(row['metadata'])
+                        clip_id = provenance['job_id']
+                        with self.store.connect() as db:
+                            db.row_factory = sqlite3.Row
+                            clip = db.execute('SELECT j.*,e.output_path,e.output_sha256 FROM clip_jobs j JOIN exports e ON j.id=e.job_id WHERE j.id=?', (clip_id,)).fetchone()
+                            existing = db.execute('SELECT id FROM review_items WHERE job_id=?', (clip_id,)).fetchone()
+                        if not clip or Path(clip['output_path']).resolve() != (directory / 'clip.mp4').resolve():
+                            raise ValueError('export record does not match the planned folder')
+                        snapshot = ClipJob(clip['id'],clip['source_id'],clip['source_path'],clip['source_sha256'],clip['start'],clip['end'])
+                        rights = verify_job(self.store, snapshot)
+                        if clip['source_sha256'] != job['digest'] or clip['source_path'] != job['path']:
+                            raise ValueError('source snapshot does not match the automation job')
+                        if any(provenance.get(k) != v for k,v in (('start',clip['start']),('end',clip['end']),('source_url',rights['source_url']),('creator',rights['creator']))):
+                            raise ValueError('source or clip boundaries do not match provenance')
+                        digest = file_hash(Path(clip['output_path']))
+                        if digest != clip['output_sha256'] or any(provenance.get(k) != v or metadata.get(k) != v for k,v in
+                            (('job_id',clip_id),('source_sha256',clip['source_sha256']),('output_sha256',digest))):
+                            raise ValueError('output hash or provenance does not match')
+                        if any(metadata.get(k) != planned.get(k) for k in ('title','description')):
+                            raise ValueError('metadata does not match the recorded plan')
+                        streams = probe(Path(clip['output_path'])).get('streams', [])
+                        if not any(s.get('codec_type') == 'video' and s.get('codec_name') == 'h264' and s.get('width') == 1080 and s.get('height') == 1920 for s in streams) or not any(s.get('codec_type') == 'audio' and s.get('codec_name') == 'aac' for s in streams):
+                            raise ValueError('output streams are not a valid vertical H.264/AAC clip')
+                        if existing: queue.validate(queue.get(existing['id']))
+                        recovered.append((row,clip_id,existing['id'] if existing else None,planned))
+                    except Exception as exc:
+                        raise ValueError(f'Recovery is uncertain; inspect {directory}: {exc}') from exc
+                for row,clip_id,item_id,planned in recovered:
+                    if item_id is None:
+                        item_id = queue.add(clip_id,row['score'],row['explanation'],planned,mark_completed=True)
+                    else:
+                        with self.store.connect() as db:
+                            db.execute('CREATE TABLE IF NOT EXISTS completed_packages (job_id TEXT PRIMARY KEY, directory TEXT NOT NULL, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)')
+                            db.execute('INSERT OR IGNORE INTO completed_packages(job_id,directory) VALUES(?,?)', (clip_id,row['directory']))
+                with self.store.connect() as db:
+                    db.execute("UPDATE automation_jobs SET status='completed',error='',updated_at=CURRENT_TIMESTAMP WHERE id=? AND status IN ('failed','interrupted')", (job_id,))
+                self._activity('reconciled', f'{len(recovered)} existing clips verified', job['source_id'], job_id)
+                return len(recovered)
+        except Timeout:
+            raise RuntimeError('Wait for the current automation worker to finish') from None
+
     def process_next(self, output_dir, maximum=3, clip_duration=20, min_score=.1, cancelled=None, progress=None, generator=generate, downloader=acquire, cpu_threads=0, min_free_bytes=0, inspector=inspect_completed_video, retry_limit=3, retry_backoff=30):
         try:
             with self.lock:
@@ -354,8 +425,10 @@ class Automation:
             if shutil.disk_usage(root).free < min_free_bytes:
                 raise OSError('Output drive has less free space than the configured minimum')
             kwargs = {'cpu_threads': cpu_threads} if cpu_threads else {}
+            if generator is generate:
+                kwargs['automation_job_id'] = job['id']
             with self.store.connect() as db:
-                db.execute('UPDATE automation_jobs SET safe_retry=0 WHERE id=?', (job['id'],))
+                db.execute('UPDATE automation_jobs SET safe_retry=0,path=?,digest=? WHERE id=?', (path, rights['sha256'], job['id']))
             items = generator(self.store,path,str(root),maximum=maximum,clip_duration=clip_duration,min_score=min_score,cancelled=cancelled_or_disabled,progress=progress,**kwargs)
             if disk_low.is_set(): raise OSError('Free disk space fell below the configured minimum during processing')
             if not items: raise ValueError('No clips were generated')

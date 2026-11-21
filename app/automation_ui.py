@@ -84,6 +84,7 @@ class AutomationPanel(QWidget):
         v.addWidget(QLabel('Recent automation activity'))
         self.activity = QListWidget(); v.addWidget(self.activity)
         retry = QPushButton('Retry failed job'); retry.clicked.connect(self.retry_job); v.addWidget(retry)
+        recover = QPushButton('Reconcile interrupted job'); recover.clicked.connect(self.reconcile_job); v.addWidget(recover)
         approve = QPushButton('Authorize selected exact video'); approve.clicked.connect(self.authorize_video); v.addWidget(approve)
         self.restore_settings(); self.refresh()
 
@@ -171,6 +172,16 @@ class AutomationPanel(QWidget):
             authorize(self.engine.store, url, source['creator'], source['evidence'])
             self.status.setText('Exact video permission recorded. Run discovery again to queue it.')
         except Exception as exc: QMessageBox.warning(self, 'Authorization', str(exc))
+
+    def reconcile_job(self):
+        index = self.jobs.currentRow()
+        if index < 0 or index >= len(self.job_rows): return
+        try:
+            count = self.engine.reconcile_job(self.job_rows[index]['id'])
+            self.refresh(); self.status.setText(f'{count} existing clips verified and reconciled.')
+            if hasattr(self.window(), 'refresh_review'): self.window().refresh_review()
+        except Exception as exc:
+            QMessageBox.warning(self, 'Manual inspection required', str(exc))
 
     def retry_job(self):
         index = self.jobs.currentRow()

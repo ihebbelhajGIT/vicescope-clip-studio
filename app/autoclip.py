@@ -1,6 +1,7 @@
 ﻿"""Automatic local-source generation. Network acquisition is deliberately absent."""
 from pathlib import Path
 import uuid
+import json
 from app.core import require_rights, transcribe
 from app.highlights import analyze_audio
 from app.review import ReviewQueue
@@ -17,7 +18,7 @@ def non_overlapping(candidates, maximum=3, min_score=0.1):
     return selected
 
 
-def generate(store, source, output_root, maximum=3, min_score=0.1, transcriber=transcribe, clip_duration=20.0, progress=None, cancelled=None, cpu_threads=0):
+def generate(store, source, output_root, maximum=3, min_score=0.1, transcriber=transcribe, clip_duration=20.0, progress=None, cancelled=None, cpu_threads=0, automation_job_id=None):
     def report(value, message):
         if progress: progress(value, message)
     def check_cancel():
@@ -42,12 +43,19 @@ def generate(store, source, output_root, maximum=3, min_score=0.1, transcriber=t
     if not root.is_dir(): raise ValueError('Choose an existing output directory')
     queue = ReviewQueue(store)
     results = []
+    if automation_job_id:
+        with store.connect() as db:
+            db.execute('INSERT INTO automation_plans(job_id,expected_count) VALUES(?,?)', (automation_job_id, len(candidates)))
     for index, candidate in enumerate(candidates):
         check_cancel()
         report(40 + int(60 * index / len(candidates)), f'Rendering clip {index + 1} of {len(candidates)}')
         creator = rights['creator'] or 'creator'
         metadata = {'title': f'A moment from {creator}', 'description': f'Credit: {creator}\n{rights["source_url"]}'.strip(), 'hashtags': ['#Shorts']}
         destination = root / ('short-' + uuid.uuid4().hex)
+        if automation_job_id:
+            with store.connect() as db:
+                db.execute('INSERT INTO automation_outputs(job_id,ordinal,directory,score,explanation,metadata) VALUES(?,?,?,?,?,?)',
+                           (automation_job_id,index,str(destination),candidate.score,candidate.explanation,json.dumps(metadata)))
         result = export_bundle(store, source, candidate.start, candidate.end, str(destination), words,
                                f'A moment from {creator}', metadata['title'], metadata['description'], mark_complete=False, cpu_threads=cpu_threads)
         item_id = queue.add(result['job_id'], candidate.score, candidate.explanation, metadata, mark_completed=True)
