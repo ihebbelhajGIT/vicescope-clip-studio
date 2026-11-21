@@ -8,6 +8,7 @@ from PySide6.QtWidgets import (QCheckBox, QComboBox, QDoubleSpinBox, QFileDialog
                                QHBoxLayout, QLabel, QLineEdit, QListWidget, QMessageBox,
                                QPushButton, QSpinBox, QVBoxLayout, QWidget)
 from app.automation import Automation
+from app.acquisition import authorize
 
 
 class ScanWorker(QObject):
@@ -22,12 +23,13 @@ class ScanWorker(QObject):
 
     def run(self):
         try:
-            self.engine.scan()
+            self.engine.scan(maximum=self.options['scan_limit'], streams=self.options['streams'])
             if self.options['generate'] and not self.paused_event.is_set() and not self.stop_event.is_set():
                 self.engine.process_next(self.options['output'], maximum=self.options['maximum'],
                     clip_duration=self.options['duration'], min_score=self.options['score'],
                     cancelled=self.stop_event.is_set, progress=self.progress.emit,
-                    cpu_threads=self.options['cpu_threads'], min_free_bytes=int(self.options['min_free_gib'] * 1024**3))
+                    cpu_threads=self.options['cpu_threads'], min_free_bytes=int(self.options['min_free_gib'] * 1024**3),
+                    retry_limit=self.options['retry_limit'], retry_backoff=self.options['retry_backoff'])
             self.completed.emit()
         except Exception as exc:
             self.failed.emit(str(exc))
@@ -42,10 +44,10 @@ class AutomationPanel(QWidget):
         self.stop_event = threading.Event(); self.paused_event = threading.Event()
         self.running = False
         v = QVBoxLayout(self)
-        info = QLabel('Folder files require individual approval unless you explicitly grant permission for every new file in that folder. YouTube permission applies only to the exact video. No upload or publication is automatic.')
+        info = QLabel('Folder files require individual approval unless you explicitly grant permission for every new file in that folder. Discovered YouTube videos require individual permission before download. No upload or publication is automatic.')
         info.setWordWrap(True); v.addWidget(info)
         form = QFormLayout(); v.addLayout(form)
-        self.kind = QComboBox(); self.kind.addItem('Local folder', 'folder'); self.kind.addItem('Exact YouTube video', 'youtube_video')
+        self.kind = QComboBox(); self.kind.addItem('Local folder', 'folder'); self.kind.addItem('Exact YouTube video', 'youtube_video'); self.kind.addItem('YouTube channel', 'youtube_channel'); self.kind.addItem('YouTube playlist', 'youtube_playlist')
         self.locator = QLineEdit(); self.creator = QLineEdit(); self.evidence = QLineEdit()
         form.addRow('Source type', self.kind); form.addRow('Folder or video URL', self.locator)
         choose = QPushButton('Choose source folder'); choose.clicked.connect(self.choose_folder); v.addWidget(choose)
@@ -67,22 +69,36 @@ class AutomationPanel(QWidget):
         form.addRow('Scan interval', self.interval); form.addRow('Maximum clips', self.maximum)
         form.addRow('Clip duration', self.duration); form.addRow('Minimum score', self.score)
         form.addRow('CPU threads per task', self.cpu_threads); form.addRow('Minimum free disk before work', self.min_free)
+        self.scan_limit = QSpinBox(); self.scan_limit.setRange(1, 100); self.scan_limit.setValue(20)
+        self.streams = QCheckBox('Monitor completed livestream recordings (channel streams tab)'); v.addWidget(self.streams)
+        form.addRow('Maximum videos scanned per source', self.scan_limit)
+        self.retry_limit = QSpinBox(); self.retry_limit.setRange(1, 10); self.retry_limit.setValue(3)
+        self.retry_backoff = QSpinBox(); self.retry_backoff.setRange(1, 3600); self.retry_backoff.setValue(30); self.retry_backoff.setSuffix(' seconds')
+        form.addRow('Download retry limit', self.retry_limit); form.addRow('Initial retry backoff', self.retry_backoff)
         self.generate_enabled = QCheckBox('Automatically generate clips for authorized sources'); v.addWidget(self.generate_enabled)
         buttons = QHBoxLayout(); v.addLayout(buttons)
-        for label, handler in (('Start / resume', self.start), ('Pause', self.pause), ('Stop', self.stop), ('Run now', self.run_now)):
+        for label, handler in (('Start / resume', self.start), ('Pause', self.pause), ('Stop', self.stop), ('Run now', self.run_now), ('Run discovery now', self.run_discovery)):
             button = QPushButton(label); button.clicked.connect(handler); buttons.addWidget(button)
         self.status = QLabel('Stopped. Automation runs only while the app is open.'); self.status.setWordWrap(True); v.addWidget(self.status)
         self.jobs = QListWidget(); v.addWidget(self.jobs)
+        retry = QPushButton('Retry failed job'); retry.clicked.connect(self.retry_job); v.addWidget(retry)
+        approve = QPushButton('Authorize selected exact video'); approve.clicked.connect(self.authorize_video); v.addWidget(approve)
         self.restore_settings(); self.refresh()
 
     def options(self):
         return {'output': self.output.text().strip(), 'interval': self.interval.value(), 'maximum': self.maximum.value(),
                 'duration': self.duration.value(), 'score': self.score.value(), 'generate': self.generate_enabled.isChecked(),
-                'cpu_threads': self.cpu_threads.value(), 'min_free_gib': self.min_free.value()}
+                'cpu_threads': self.cpu_threads.value(), 'min_free_gib': self.min_free.value(),
+                'scan_limit': self.scan_limit.value(), 'streams': self.streams.isChecked(),
+                'retry_limit': self.retry_limit.value(), 'retry_backoff': self.retry_backoff.value()}
 
     def restore_settings(self):
         data = self.engine.settings()
         try:
+            if isinstance(data.get('retry_limit'), int): self.retry_limit.setValue(data['retry_limit'])
+            if isinstance(data.get('retry_backoff'), int): self.retry_backoff.setValue(data['retry_backoff'])
+            if isinstance(data.get('scan_limit'), int): self.scan_limit.setValue(data['scan_limit'])
+            if isinstance(data.get('streams'), bool): self.streams.setChecked(data['streams'])
             if isinstance(data.get('output'), str): self.output.setText(data['output'])
             if isinstance(data.get('interval'), int): self.interval.setValue(data['interval'])
             if isinstance(data.get('maximum'), int): self.maximum.setValue(data['maximum'])
@@ -129,10 +145,36 @@ class AutomationPanel(QWidget):
         self.source_rows = self.engine.list_sources()
         self.sources.clear()
         for row in self.source_rows:
-            self.sources.addItem(f"{'Enabled' if row['enabled'] else 'Disabled'} | {row['kind']} | {row['creator']} | {row['value']}")
+            self.sources.addItem(f"{'Enabled' if row['enabled'] else 'Disabled'} | {row['kind']} | {row['creator']} | {row['value']} | Last checked: {row['last_checked'] or 'never'} | New: {row['new_found']} | Individual video permission required")
         self.jobs.clear()
-        for row in self.engine.list_jobs()[:200]:
+        self.job_rows = self.engine.list_jobs()[:200]
+        for row in self.job_rows:
             self.jobs.addItem(f"{row['status']} | {row['path'] or row['source_key']} | {row['error']}")
+
+    def authorize_video(self):
+        index = self.jobs.currentRow()
+        if index < 0 or index >= len(self.job_rows): return
+        job = self.job_rows[index]
+        url = job.get('video_url')
+        source = next((row for row in self.source_rows if row['id'] == job['source_id']), None)
+        if not url or not source:
+            QMessageBox.warning(self, 'Authorization', 'Select a discovered YouTube video.'); return
+        decision = QMessageBox.question(self, 'Approve exact video',
+            f"Do you have permission to download and reuse this exact video?\n\n{url}\nCreator: {source['creator']}\nEvidence: {source['evidence']}")
+        if decision != QMessageBox.StandardButton.Yes: return
+        try:
+            authorize(self.engine.store, url, source['creator'], source['evidence'])
+            self.status.setText('Exact video permission recorded. Run discovery again to queue it.')
+        except Exception as exc: QMessageBox.warning(self, 'Authorization', str(exc))
+
+    def retry_job(self):
+        index = self.jobs.currentRow()
+        if index < 0 or index >= len(self.job_rows): return
+        try:
+            self.engine.retry_job(self.job_rows[index]['id'])
+            self.refresh(); self.status.setText('Job queued for retry; rights will be checked again.')
+        except Exception as exc:
+            QMessageBox.warning(self, 'Retry unavailable', str(exc))
 
     def start(self):
         if self.thread is not None:
@@ -155,9 +197,15 @@ class AutomationPanel(QWidget):
             self.status.setText('A scan or processing job is already active.'); return
         self.stop_event.clear(); self.paused_event.clear(); self.tick()
 
-    def tick(self):
+    def run_discovery(self):
+        if self.thread is not None:
+            self.status.setText('A scan or processing job is already active.'); return
+        self.stop_event.clear(); self.paused_event.clear(); self.tick(discovery_only=True)
+
+    def tick(self, discovery_only=False):
         if self.thread is not None: return
         options = self.options()
+        if discovery_only: options['generate'] = False
         self.thread = QThread(self); self.worker = ScanWorker(self.engine, options, self.stop_event, self.paused_event)
         self.worker.moveToThread(self.thread)
         self.thread.started.connect(self.worker.run)

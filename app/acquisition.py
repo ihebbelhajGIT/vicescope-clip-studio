@@ -113,3 +113,48 @@ def acquire(store, url: str, root: str, runner=subprocess.run):
     if current != rights: raise PermissionError('Video permission changed during download')
     store.save_source(str(media), rights[0], canonical_url, rights[1], True, youtube_video_id=video_id)
     return str(media)
+
+
+def collection_url(kind: str, value: str) -> str:
+    """Validate a public YouTube collection locator without following arbitrary URLs."""
+    value = value.strip()
+    if kind == 'youtube_channel' and re.fullmatch(r'UC[A-Za-z0-9_-]{22}', value):
+        return 'https://www.youtube.com/channel/' + value + '/videos'
+    if kind == 'youtube_playlist' and re.fullmatch(r'[A-Za-z0-9_-]{10,100}', value):
+        return 'https://www.youtube.com/playlist?list=' + value
+    parts = urlsplit(value)
+    if parts.scheme != 'https' or parts.username or parts.password or parts.port or (parts.hostname or '').lower() not in ('youtube.com', 'www.youtube.com', 'm.youtube.com'):
+        raise ValueError('Enter a valid HTTPS YouTube channel or playlist URL')
+    if kind == 'youtube_channel':
+        match = re.fullmatch(r'/(channel/UC[A-Za-z0-9_-]{22}|@[A-Za-z0-9_.-]{3,100})(?:/(?:videos|streams))?/?', parts.path)
+        if not match: raise ValueError('Enter a YouTube channel ID or channel URL')
+        return 'https://www.youtube.com/' + match.group(1) + '/videos'
+    if kind == 'youtube_playlist' and parts.path == '/playlist':
+        ids = parse_qs(parts.query).get('list', [])
+        if len(ids) == 1 and re.fullmatch(r'[A-Za-z0-9_-]{10,100}', ids[0]):
+            return 'https://www.youtube.com/playlist?list=' + ids[0]
+    raise ValueError('Enter a YouTube playlist ID or playlist URL')
+
+
+def discover_collection(kind, value, maximum=20, streams=False, runner=subprocess.run):
+    """Read bounded public metadata; this does not grant reuse permission."""
+    if not 1 <= maximum <= 100: raise ValueError('Discovery limit must be between 1 and 100')
+    url = collection_url(kind, value)
+    if kind == 'youtube_channel' and streams: url = url.removesuffix('/videos') + '/streams'
+    cmd = ytdlp_command('--ignore-config', '--no-cookies', '--flat-playlist', '--skip-download', '--playlist-end', str(maximum), '--dump-single-json', url)
+    try:
+        result = runner(cmd, capture_output=True, check=True, timeout=120, **process_options(bundled_child=True))
+        data = json.loads(result.stdout)
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError('YouTube discovery timed out') from exc
+    except (subprocess.CalledProcessError, ValueError, TypeError) as exc:
+        raise RuntimeError('YouTube discovery failed or returned invalid metadata') from exc
+    if not isinstance(data, dict) or not isinstance(data.get('entries'), list):
+        raise RuntimeError('YouTube discovery returned invalid entries')
+    found = []
+    for item in data['entries'][:maximum]:
+        if not isinstance(item, dict) or not re.fullmatch(r'[A-Za-z0-9_-]{11}', str(item.get('id', ''))): continue
+        if item.get('is_live') or item.get('live_status') in ('is_live', 'is_upcoming', 'post_live'): continue
+        if item.get('has_drm') or item.get('availability') in ('private', 'needs_auth', 'premium_only', 'subscriber_only'): continue
+        found.append({'id': item['id'], 'title': str(item.get('title') or '')[:300], 'live_status': item.get('live_status')})
+    return found

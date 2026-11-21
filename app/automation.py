@@ -11,9 +11,10 @@ import uuid
 import json
 import time
 import shutil
+import threading
 from pathlib import Path
 from filelock import FileLock, Timeout
-from app.acquisition import acquire, authorize, youtube_id, inspect_completed_video
+from app.acquisition import acquire, authorize, youtube_id, inspect_completed_video, collection_url, discover_collection
 from app.core import require_rights
 from app.autoclip import generate
 
@@ -47,6 +48,11 @@ class Automation:
             if 'next_retry' not in columns:
                 db.execute('ALTER TABLE automation_jobs ADD COLUMN next_retry REAL')
             source_columns = {row[1] for row in db.execute('PRAGMA table_info(automation_sources)')}
+            if 'last_checked' not in source_columns: db.execute("ALTER TABLE automation_sources ADD COLUMN last_checked TEXT")
+            if 'new_found' not in source_columns: db.execute("ALTER TABLE automation_sources ADD COLUMN new_found INTEGER NOT NULL DEFAULT 0")
+            if 'video_url' not in columns: db.execute("ALTER TABLE automation_jobs ADD COLUMN video_url TEXT")
+            if 'safe_retry' not in columns: db.execute("ALTER TABLE automation_jobs ADD COLUMN safe_retry INTEGER NOT NULL DEFAULT 0")
+            if 'title' not in columns: db.execute("ALTER TABLE automation_jobs ADD COLUMN title TEXT NOT NULL DEFAULT ''")
             if 'auto_approve' not in source_columns:
                 db.execute('ALTER TABLE automation_sources ADD COLUMN auto_approve INTEGER NOT NULL DEFAULT 0')
         try:
@@ -58,13 +64,15 @@ class Automation:
             pass
 
     def add_source(self, kind, value, creator, evidence, auto_approve=False):
-        if kind not in ('folder', 'youtube_video') or not creator.strip() or not evidence.strip():
+        if kind not in ('folder', 'youtube_video', 'youtube_channel', 'youtube_playlist') or not creator.strip() or not evidence.strip():
             raise ValueError('Select a supported source and provide creator and rights evidence')
         if auto_approve and kind != 'folder': raise ValueError('Folder-wide authorization applies only to local folders')
         if kind == 'folder':
             path = Path(value).expanduser().resolve(strict=True)
             if not path.is_dir(): raise ValueError('Choose an existing local folder')
             value = str(path)
+        elif kind in ('youtube_channel', 'youtube_playlist'):
+            value = collection_url(kind, value)
         else:
             video_id = youtube_id(value)
             value = 'https://www.youtube.com/watch?v=' + video_id
@@ -109,13 +117,41 @@ class Automation:
             db.row_factory = sqlite3.Row
             return [dict(x) for x in db.execute('SELECT * FROM automation_jobs ORDER BY updated_at DESC, rowid DESC')]
 
-    def scan(self):
+    def scan(self, maximum=20, streams=False, discoverer=discover_collection):
         for source in self.list_sources():
             if not source['enabled']: continue
             if source['kind'] == 'youtube_video':
                 self._observe_youtube(source)
             elif source['kind'] == 'folder':
                 self._observe_folder(source)
+            elif source['kind'] in ('youtube_channel', 'youtube_playlist'):
+                self._observe_collection(source, maximum, streams, discoverer)
+
+    def _observe_collection(self, source, maximum, streams, discoverer):
+        try:
+            entries = discoverer(source['kind'], source['value'], maximum, streams)
+        except Exception as exc:
+            self._source_error(source, 'Discovery failed: ' + str(exc)[:400])
+            return
+        new = 0
+        with self.store.connect() as db:
+            for entry in entries:
+                video_id = entry.get('id', '')
+                try: youtube_id('https://youtu.be/' + video_id)
+                except (ValueError, TypeError): continue
+                if entry.get('live_status') in ('is_live', 'is_upcoming', 'post_live'): continue
+                url = 'https://www.youtube.com/watch?v=' + video_id
+                key = 'youtube:' + video_id
+                permitted = db.execute('SELECT 1 FROM sqlite_master WHERE type="table" AND name="youtube_permissions"').fetchone()
+                rights = db.execute('SELECT 1 FROM youtube_permissions WHERE video_id=? AND approved=1', (video_id,)).fetchone() if permitted else None
+                result = db.execute("""INSERT OR IGNORE INTO automation_jobs(id,source_id,source_key,video_url,title,status,error)
+                    VALUES(?,?,?,?,?,?,?)""", (str(uuid.uuid4()),source['id'],key,url,str(entry.get('title',''))[:300],
+                        'pending' if rights else 'awaiting_authorization', '' if rights else 'Approve this exact video in Automation'))
+                new += result.rowcount
+                db.execute("""UPDATE automation_jobs SET status=?,error=?,updated_at=CURRENT_TIMESTAMP
+                    WHERE source_id=? AND source_key=? AND (status IN ('pending','awaiting_authorization') OR (status='retry_wait' AND (next_retry<=? OR ?=0)))""",
+                    ('pending' if rights else 'awaiting_authorization', '' if rights else 'Exact video permission required',source['id'],key,self.clock(),int(bool(rights))))
+            db.execute('UPDATE automation_sources SET last_checked=CURRENT_TIMESTAMP,new_found=? WHERE id=?', (new,source['id']))
 
     def _observe_youtube(self, source):
         video_id = youtube_id(source['value'])
@@ -190,17 +226,29 @@ class Automation:
             db.execute('''INSERT INTO automation_jobs(id,source_id,source_key,status,error) VALUES(?,?,?,?,?)
                 ON CONFLICT(source_key) DO UPDATE SET error=excluded.error,updated_at=CURRENT_TIMESTAMP''', (str(uuid.uuid4()),source['id'],'source:' + source['id'],'failed',error))
 
-    def process_next(self, output_dir, maximum=3, clip_duration=20, min_score=.1, cancelled=None, progress=None, generator=generate, downloader=acquire, cpu_threads=0, min_free_bytes=0, inspector=inspect_completed_video):
+    def retry_job(self, job_id):
+        """Retry only when generation never began, avoiding duplicate review clips."""
         try:
             with self.lock:
-                return self._process_next(output_dir, maximum, clip_duration, min_score, cancelled, progress, generator, downloader, cpu_threads, min_free_bytes, inspector)
+                with self.store.connect() as db:
+                    changed = db.execute("""UPDATE automation_jobs SET status='pending',attempts=0,next_retry=NULL,error='',updated_at=CURRENT_TIMESTAMP
+                        WHERE id=? AND status IN ('failed','interrupted') AND safe_retry=1""", (job_id,)).rowcount
+                    if not changed:
+                        raise ValueError('Cannot safely retry this job: it may have produced clips or has no retryable failure. Inspect its outputs first.')
+        except Timeout:
+            raise RuntimeError('Wait for the current automation worker to finish') from None
+
+    def process_next(self, output_dir, maximum=3, clip_duration=20, min_score=.1, cancelled=None, progress=None, generator=generate, downloader=acquire, cpu_threads=0, min_free_bytes=0, inspector=inspect_completed_video, retry_limit=3, retry_backoff=30):
+        try:
+            with self.lock:
+                return self._process_next(output_dir, maximum, clip_duration, min_score, cancelled, progress, generator, downloader, cpu_threads, min_free_bytes, inspector, retry_limit, retry_backoff)
         except Timeout:
             raise RuntimeError('Another automation worker is already running') from None
 
-    def _process_next(self, output_dir, maximum, clip_duration, min_score, cancelled, progress, generator, downloader, cpu_threads, min_free_bytes, inspector):
+    def _process_next(self, output_dir, maximum, clip_duration, min_score, cancelled, progress, generator, downloader, cpu_threads, min_free_bytes, inspector, retry_limit, retry_backoff):
         root = Path(output_dir).expanduser().resolve(strict=True)
         if not root.is_dir(): raise ValueError('Choose an existing output folder')
-        if not isinstance(cpu_threads, int) or cpu_threads < 0 or min_free_bytes < 0:
+        if not isinstance(cpu_threads, int) or cpu_threads < 0 or min_free_bytes < 0 or not 1 <= retry_limit <= 10 or not 1 <= retry_backoff <= 3600:
             raise ValueError('Invalid resource limits')
         if shutil.disk_usage(root).free < min_free_bytes:
             raise OSError('Output drive has less free space than the configured minimum')
@@ -211,34 +259,46 @@ class Automation:
             row = db.execute("SELECT j.*,s.kind,s.value,s.creator,s.evidence,s.enabled FROM automation_jobs j JOIN automation_sources s ON s.id=j.source_id WHERE j.status='pending' AND s.enabled=1 ORDER BY j.rowid LIMIT 1").fetchone()
             if row is None: return None
             job = dict(row)
-            db.execute("UPDATE automation_jobs SET status='processing',error='',updated_at=CURRENT_TIMESTAMP WHERE id=? AND status='pending'", (job['id'],))
+            db.execute("UPDATE automation_jobs SET status='processing',safe_retry=1,error='',updated_at=CURRENT_TIMESTAMP WHERE id=? AND status='pending'", (job['id'],))
+        disk_low = threading.Event()
+        disk_monitor_stop = threading.Event()
+        def monitor_disk():
+            while not disk_monitor_stop.is_set():
+                try:
+                    if shutil.disk_usage(root).free < min_free_bytes: disk_low.set(); return
+                except OSError:
+                    disk_low.set(); return
+                disk_monitor_stop.wait(1)
+        disk_thread = threading.Thread(target=monitor_disk, daemon=True) if min_free_bytes else None
+        if disk_thread: disk_thread.start()
         def cancelled_or_disabled():
-            if cancelled and cancelled(): return True
+            if disk_low.is_set() or (cancelled and cancelled()): return True
             with self.store.connect() as db:
                 current = db.execute('SELECT enabled FROM automation_sources WHERE id=?', (job['source_id'],)).fetchone()
             return not current or not current[0]
         try:
             if cancelled_or_disabled(): raise InterruptedError('Automation stopped or source disabled')
-            if job['kind'] == 'youtube_video':
+            if job['kind'] in ('youtube_video', 'youtube_channel', 'youtube_playlist'):
+                video_url = job['video_url'] or job['value']
                 # Recheck exact-ID rights before even requesting metadata.
                 with self.store.connect() as db:
-                    permission = db.execute('SELECT creator,evidence,approved FROM youtube_permissions WHERE video_id=?', (youtube_id(job['value']),)).fetchone()
-                if permission != (job['creator'], job['evidence'], 1):
+                    permission = db.execute('SELECT creator,evidence,approved FROM youtube_permissions WHERE video_id=?', (youtube_id(video_url),)).fetchone()
+                if not permission or not permission[2] or (job['kind'] == 'youtube_video' and permission != (job['creator'], job['evidence'], 1)):
                     raise PermissionError('Exact video permission was changed or revoked')
                 try:
-                    inspector(job['value'])
+                    inspector(video_url)
                     if cancelled_or_disabled(): raise InterruptedError('Automation stopped or source disabled')
                     # acquire rechecks authorization before downloading.
-                    path = downloader(self.store,job['value'],str(root))
+                    path = downloader(self.store,video_url,str(root))
                 except RuntimeError as exc:
                     message = str(exc)
                     transient = any(term in message.lower() for term in ('timed out', 'timeout', 'network', 'connection', 'temporarily unavailable', 'http error 429', 'http error 502', 'http error 503', 'http error 504'))
                     if not transient: raise
                     attempts = job['attempts'] + 1
-                    status = 'retry_wait' if attempts < 3 else 'failed'
-                    delay = 30 * (2 ** (attempts - 1))
+                    status = 'retry_wait' if attempts < retry_limit else 'failed'
+                    delay = retry_backoff * (2 ** (attempts - 1))
                     with self.store.connect() as db:
-                        db.execute("UPDATE automation_jobs SET status=?,attempts=?,next_retry=?,error=?,updated_at=CURRENT_TIMESTAMP WHERE id=?", (status, attempts, self.clock() + delay if status == 'retry_wait' else None, 'Temporary download failure; retry scheduled' if status == 'retry_wait' else 'Download failed after three attempts',job['id']))
+                        db.execute("UPDATE automation_jobs SET status=?,attempts=?,next_retry=?,error=?,updated_at=CURRENT_TIMESTAMP WHERE id=?", (status, attempts, self.clock() + delay if status == 'retry_wait' else None, 'Temporary download failure; retry scheduled' if status == 'retry_wait' else f'Download failed after {retry_limit} attempts',job['id']))
                     return None
             else:
                 path = job['path']
@@ -249,12 +309,19 @@ class Automation:
             if shutil.disk_usage(root).free < min_free_bytes:
                 raise OSError('Output drive has less free space than the configured minimum')
             kwargs = {'cpu_threads': cpu_threads} if cpu_threads else {}
+            with self.store.connect() as db:
+                db.execute('UPDATE automation_jobs SET safe_retry=0 WHERE id=?', (job['id'],))
             items = generator(self.store,path,str(root),maximum=maximum,clip_duration=clip_duration,min_score=min_score,cancelled=cancelled_or_disabled,progress=progress,**kwargs)
+            if disk_low.is_set(): raise OSError('Free disk space fell below the configured minimum during processing')
             if not items: raise ValueError('No clips were generated')
             with self.store.connect() as db:
                 db.execute("UPDATE automation_jobs SET path=?,digest=?,status='completed',error='',updated_at=CURRENT_TIMESTAMP WHERE id=?", (path,rights['sha256'],job['id']))
             return items
         except Exception as exc:
+            if disk_low.is_set(): exc = OSError('Free disk space fell below the configured minimum during processing')
             with self.store.connect() as db:
                 db.execute("UPDATE automation_jobs SET status=?,error=?,updated_at=CURRENT_TIMESTAMP WHERE id=?", ('interrupted' if isinstance(exc,InterruptedError) else 'failed',str(exc)[:500],job['id']))
-            raise
+            raise exc
+        finally:
+            disk_monitor_stop.set()
+            if disk_thread: disk_thread.join(timeout=2)
